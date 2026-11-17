@@ -1,26 +1,27 @@
-//! POS Mail Native — Фаза 0, шип скорости (TASK-N01).
+//! POS Mail Native — Фаза 1: почтовый каркас (TASK-N02).
 //!
-//! Цель: доказать, что нативная оболочка Win32 решает проблему «рамка летит,
-//! содержимое тормозит», из-за которой POS Mail на WebView2 переписывался
-//! четырежды (TASK-099…108).
+//! Нативная оболочка Win32 (Фаза 0, TASK-N01) подключена к почтовому ядру
+//! Soroka: ящики из accounts.json, папки из кэша SQLite, реальные письма
+//! в виртуальном списке, тело письма в WebView2-панели, написание/ответ
+//! отдельным окном, отправка SMTP, вложения, очередь исходящих.
 //!
-//! Что в окне:
-//! - дерево папок (TreeView, слева);
-//! - список писем — ВИРТУАЛЬНЫЙ ListView на 50 000 строк (LVS_OWNERDATA):
-//!   данные отдаются по запросу LVN_GETDISPINFO, элементы не хранятся
-//!   контролом — переложение при ресайзе не зависит от объёма;
-//! - панель письма — WebView2 (webview2-com), только для HTML-тела письма;
-//! - статус-бар.
+//! Архитектура ресайза не изменилась: раскладку ведёт WM_SIZE через
+//! SetWindowPos (микросекунды), WebView2 обновляется bounds'ом — DOM в
+//! кадре ресайза по-прежнему нет.
 //!
-//! Ресайз ведёт системная рамка Windows; раскладку панелей делает WM_SIZE
-//! через SetWindowPos (микросекунды, GDI), WebView2 обновляется bounds'ом.
-//! DOM в кадре ресайза нет — тормозить нечему.
-//!
-//! Код написан под windows 0.62 / webview2-com 0.39 (версии wry 0.57).
-//! Если при сборке сигнатуры не совпадут — править минимально, по подсказкам
-//! cargo (см. docs/WORKFLOW.md).
+//! Код под windows 0.62 / webview2-com 0.39 (версии wry 0.57). Если при
+//! сборке сигнатуры не совпадут — править минимально (docs/WORKFLOW.md).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod account_dlg;
+mod ai;
+mod backend;
+mod compose;
+mod mail;
+mod state;
+mod ui;
+mod wide;
 
 use std::sync::mpsc;
 
@@ -32,124 +33,47 @@ use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 use windows::Win32::Foundation::{
     E_POINTER, E_UNEXPECTED, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetStockObject, PAINTSTRUCT, DEFAULT_GUI_FONT,
-};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    HTREEITEM, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx, LVCOLUMNW, LVIF_TEXT, LVM_INSERTCOLUMNW, LVM_SETITEMCOUNT,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVN_GETDISPINFOW, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NM_DBLCLK, NMHDR, NMLVDISPINFOW,
-    NMITEMACTIVATE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVI_LAST, TVI_ROOT, TVITEMW,
-    TVM_INSERTITEMW, WC_LISTVIEW, WC_TREEVIEW,
+    ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    LVN_GETDISPINFOW, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NMHDR, NMLVDISPINFOW,
+    NMLISTVIEW, NMTREEVIEWW, NM_CUSTOMDRAW, TVN_SELCHANGEDW, WC_LISTVIEW, WC_TREEVIEW,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-    DispatchMessageW, GetClientRect, GetMessageW, GWLP_USERDATA, GetWindowLongPtrW, IDC_ARROW,
-    LoadCursorW, MINMAXINFO, MSG, PostQuitMessage, RegisterClassW, SWP_NOZORDER, SW_SHOW,
-    SendMessageW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_DESTROY, WM_GETMINMAXINFO, WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_SETFONT,
-    WM_SIZE, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW, GWLP_USERDATA, GetWindowLongPtrW,
+    IDC_ARROW, LoadCursorW, MB_ICONINFORMATION, MB_OK, MB_YESNO, MINMAXINFO, MSG, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SWP_NOZORDER, SW_SHOW, SendMessageW,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateAcceleratorW, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO, WM_NCCREATE,
+    WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
 
-/// Сообщение статус-бара (SB_SETTEXTW из commctrl: WM_USER + 11).
-const SB_SET_TEXT: u32 = 0x040B;
+use account_dlg::{WM_APP_ACCOUNT_CLOSED, WM_APP_ACCOUNT_SAVED};
+use backend::{Backend, Job, WM_APP_MAIL, WM_APP_SEND_RESULT};
+use compose::{ComposePrefill, WM_APP_COMPOSE_CLOSED};
+use state::AppState;
+use ui::{
+    PANE_W, STATUS_H, TREE_W, apply_mail_event, create_fonts, create_menu, empty_pane_html,
+    on_get_disp_info, on_list_custom_draw, on_list_item_changed, on_tree_select, rebuild_tree,
+    setup_list_columns, status_text, IDM_ACCOUNT_ADD, IDM_COMPOSE, IDM_DELETE, IDM_EXIT,
+    IDM_FORWARD, IDM_REPLY, IDM_REPLY_ALL, IDM_SYNC, IDM_TOGGLE_SEEN,
+};
 
 const WINDOW_CLASS: PCWSTR = w!("SorokaNativeWnd");
 const STATUSBAR_CLASS: PCWSTR = w!("msctls_statusbar32");
 
-/// Ширины панелей раскладки, px.
-const TREE_W: i32 = 240;
-const PANE_W: i32 = 420;
-const STATUS_H: i32 = 26;
-const ROWS: usize = 50_000;
+/// Клик по вложению в панели письма (WebView2 → оболочка): lparam = индекс.
+const WM_APP_ATTACH_CLICK: u32 = WM_APP_ACCOUNT_CLOSED + 1;
 
-/// Строка «письма» для виртуального списка.
-struct Row {
-    from: String,
-    subject: String,
-    date: String,
-}
-
-/// Состояние приложения: одно окно, один поток.
-struct AppState {
-    rows: Vec<Row>,
-    hwnd_tree: HWND,
-    hwnd_list: HWND,
-    hwnd_status: HWND,
-    controller: Option<ICoreWebView2Controller>,
-    webview: Option<ICoreWebView2>,
-}
-
-impl AppState {
-    fn new(rows: Vec<Row>) -> Self {
-        Self {
-            rows,
-            hwnd_tree: HWND::default(),
-            hwnd_list: HWND::default(),
-            hwnd_status: HWND::default(),
-            controller: None,
-            webview: None,
-        }
-    }
-}
-
-fn make_rows(n: usize) -> Vec<Row> {
-    (0..n)
-        .map(|i| Row {
-            from: format!("Отправитель {} <user{}@example.com>", i % 997, i),
-            subject: format!(
-                "Тема письма №{} — виртуальный список не боится объёма",
-                i
-            ),
-            date: format!("18.11.2026 {:02}:{:02}", (i / 60) % 24, i % 60),
-        })
-        .collect()
-}
-
-/// HTML «тела письма» для панели WebView2.
-fn letter_html(row: &Row) -> String {
-    format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><style>
-body {{ font-family: 'Segoe UI', sans-serif; background: #1c1e24; color: #d6d9e0; margin: 24px; }}
-h1 {{ font-size: 17px; font-weight: 600; margin: 0 0 6px; }}
-.meta {{ color: #8b93a3; font-size: 13px; margin-bottom: 18px; }}
-p {{ line-height: 1.55; max-width: 62ch; font-size: 14px; }}
-.note {{ border-left: 3px solid #4c7ad0; padding-left: 12px; color: #a9b4c9; }}
-</style></head><body>
-<h1>{}</h1>
-<div class="meta">{} · {}</div>
-<p>Это панель письма — единственное место, где работает WebView2. Оболочка —
-дерево, список на 50 000 строк, рамка, статус-бар — рисуется чистым Win32/GDI
-и не зависит от этого движка.</p>
-<p class="note">Тяни край окна: список переложится мгновенно при любом объёме.
-Двойной клик по строке открывает «письмо» здесь.</p>
-<p>С уважением, проверка скорости.</p>
-</body></html>"#,
-        row.subject, row.from, row.date
-    )
-}
-
-/// Копирует UTF-16 строку в буфер элемента списка (с нулём на конце).
-fn copy_utf16(dst: windows::core::PWSTR, cap: i32, text: &str) {
-    let cap = cap.max(0) as usize;
-    if cap == 0 {
-        return;
-    }
-    let mut written = 0usize;
-    for (i, unit) in text.encode_utf16().take(cap - 1).enumerate() {
-        unsafe { *dst.0.add(i) = unit };
-        written = i + 1;
-    }
-    unsafe { *dst.0.add(written) = 0 };
-}
-
-/// Раскладка панелей. Вызывается из WM_SIZE и после создания.
+/// Раскладка панелей (как в Фазе 0, но с учетом статуса и новой ширины панели).
 unsafe fn layout(hwnd: HWND, st: &AppState) {
     let mut rc = RECT::default();
     if unsafe { GetClientRect(hwnd, &mut rc) }.is_err() {
@@ -158,14 +82,12 @@ unsafe fn layout(hwnd: HWND, st: &AppState) {
     let w = rc.right;
     let h = rc.bottom;
     let h_main = (h - STATUS_H).max(0);
-    if !st.hwnd_tree.0.is_null() {
-        unsafe {
+    unsafe {
+        if !st.hwnd_tree.0.is_null() {
             let _ = SetWindowPos(st.hwnd_tree, None, 0, 0, TREE_W, h_main, SWP_NOZORDER);
         }
-    }
-    if !st.hwnd_list.0.is_null() {
-        let list_w = (w - TREE_W - PANE_W).max(120);
-        unsafe {
+        if !st.hwnd_list.0.is_null() {
+            let list_w = (w - TREE_W - PANE_W).max(160);
             let _ = SetWindowPos(
                 st.hwnd_list,
                 None,
@@ -176,40 +98,23 @@ unsafe fn layout(hwnd: HWND, st: &AppState) {
                 SWP_NOZORDER,
             );
         }
-    }
-    if !st.hwnd_status.0.is_null() && h > STATUS_H {
-        unsafe {
-            let _ = SetWindowPos(st.hwnd_status, None, 0, h - STATUS_H, w, STATUS_H, SWP_NOZORDER);
+        if !st.hwnd_status.0.is_null() && h > STATUS_H {
+            let _ =
+                SetWindowPos(st.hwnd_status, None, 0, h - STATUS_H, w, STATUS_H, SWP_NOZORDER);
         }
-    }
-    if let Some(ctrl) = &st.controller {
-        let left = (w - PANE_W).max(TREE_W + 120);
-        let _ = unsafe {
-            ctrl.SetBounds(RECT {
+        if let Some(ctrl) = &st.controller {
+            let left = (w - PANE_W).max(TREE_W + 160);
+            let _ = ctrl.SetBounds(RECT {
                 left,
                 top: 0,
                 right: left + PANE_W,
                 bottom: h_main,
-            })
-        };
+            });
+        }
     }
 }
 
-/// Текст в статус-бар.
-unsafe fn status_text(st: &AppState, text: &str) {
-    let mut buf: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        SendMessageW(
-            st.hwnd_status,
-            SB_SET_TEXT,
-            Some(WPARAM(0)),
-            Some(LPARAM(buf.as_mut_ptr() as isize)),
-        );
-    }
-}
-
-/// `webview2-com` 0.39 отдаёт собственный `Error`; `From` в `windows::core::Error`
-/// нет — приводим вручную.
+/// `webview2-com` 0.39 отдаёт собственный `Error`; приводим вручную.
 fn wv_err(err: webview2_com::Error) -> Error {
     match err {
         webview2_com::Error::WindowsError(e) => e,
@@ -217,8 +122,7 @@ fn wv_err(err: webview2_com::Error) -> Error {
     }
 }
 
-/// Создание WebView2 (среда + контроллер) на родительском окне.
-/// Паттерн — как в wry 0.57: замыкания-обработчики + wait_with_pump.
+/// Создание WebView2 + приём кликов по вложениям (паттерн wry 0.57).
 unsafe fn create_webview(parent: HWND) -> Result<(ICoreWebView2Controller, ICoreWebView2)> {
     let (tx, rx) = mpsc::channel();
     let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
@@ -254,54 +158,132 @@ unsafe fn create_webview(parent: HWND) -> Result<(ICoreWebView2Controller, ICore
     unsafe { env.CreateCoreWebView2Controller(parent, &ctrl_handler)? };
     let controller = wait_with_pump(rx2).map_err(wv_err)??;
     let webview = unsafe { controller.CoreWebView2()? };
-    // Контроллер приходит скрытым (IsVisible=false): без явного показа панель
-    // остаётся чёрной — проверено на 157.0.4341.46.
+    // Контроллер приходит скрытым — без явного показа панель останется чёрной
+    // (проверено на 157.0.4341.46 в Фазе 0).
     unsafe { controller.SetIsVisible(true)? };
+
+    // Клик по вложению в HTML → postMessage("attach:N") → задача бэкенду.
+    // Замыкание живёт в COM-обработчике; держим клон канала и HWND родителя.
+    // Токен — обычный i64 (паттерн wry 0.57 под webview2-com 0.39).
+    let mut token: i64 = 0;
+    unsafe {
+        webview.add_WebMessageReceived(
+            &WebMessageReceivedEventHandler::create(Box::new(
+                move |_sender, args| -> Result<()> {
+                    let Some(args) = args else {
+                        return Ok(());
+                    };
+                    let mut text = windows::core::PWSTR::null();
+                    unsafe { args.TryGetWebMessageAsString(&mut text)? };
+                    if text.is_null() {
+                        return Ok(());
+                    }
+                    // PWSTR → String вручную: не зависим от вспомогательных API.
+                    let mut len = 0usize;
+                    while unsafe { *text.0.add(len) } != 0 {
+                        len += 1;
+                    }
+                    let units = unsafe { std::slice::from_raw_parts(text.0, len) };
+                    let msg = String::from_utf16_lossy(units);
+                    if let Some(idx) = msg
+                        .strip_prefix("attach:")
+                        .and_then(|n| n.trim().parse::<u32>().ok())
+                    {
+                        let _ = PostMessageW(
+                            Some(parent),
+                            WM_APP_ATTACH_CLICK,
+                            WPARAM(0),
+                            LPARAM(idx as isize),
+                        );
+                    }
+                    Ok(())
+                },
+            )),
+            &mut token,
+        )?;
+    }
+
     Ok((controller, webview))
 }
 
-unsafe fn lv_column(lv: HWND, index: usize, title: &str, cx: i32) {
-    let mut buf: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    let col = LVCOLUMNW {
-        mask: windows::Win32::UI::Controls::LVCF_TEXT
-            | windows::Win32::UI::Controls::LVCF_WIDTH,
-        pszText: windows::core::PWSTR(buf.as_mut_ptr()),
-        cchTextMax: buf.len() as i32,
-        cx,
-        ..Default::default()
+/// Цитата исходного письма для ответа/пересылки.
+fn quote_body(hdr: &mail::imap::MessageHeader, pane: Option<&state::PaneBody>) -> String {
+    let plain = match pane {
+        Some(p) => p
+            .text
+            .clone()
+            .unwrap_or_else(|| {
+                p.html.as_deref().map(mail::body::html_to_text).unwrap_or_default()
+            }),
+        None => String::new(),
     };
-    unsafe {
-        SendMessageW(
-            lv,
-            LVM_INSERTCOLUMNW,
-            Some(WPARAM(index)),
-            Some(LPARAM(&col as *const LVCOLUMNW as isize)),
-        );
+    let mut cut = plain;
+    if cut.len() > 20_000 {
+        // Усечение по границе символа — String::truncate паникует посреди UTF-8.
+        let mut end = 20_000;
+        while end > 0 && !cut.is_char_boundary(end) {
+            end -= 1;
+        }
+        cut.truncate(end);
+        cut.push_str("\n…(обрезано)");
     }
+    let quoted: String = cut.lines().map(|l| format!("> {l}\n")).collect();
+    format!(
+        "\n\n----- Исходное письмо -----\nОт: {}\nКому: {}\nТема: {}\nДата: {}\n\n{}",
+        hdr.from, hdr.to, hdr.subject, hdr.date, quoted
+    )
 }
 
-unsafe fn tv_insert(tv: HWND, parent: HTREEITEM, text: &str) {
-    let mut buf: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let ins = TVINSERTSTRUCTW {
-        hParent: parent,
-        hInsertAfter: TVI_LAST,
-        Anonymous: TVINSERTSTRUCTW_0 {
-            item: TVITEMW {
-                mask: TVIF_TEXT,
-                pszText: windows::core::PWSTR(buf.as_mut_ptr()),
-                cchTextMax: buf.len() as i32,
-                ..Default::default()
-            },
-        },
+/// Ответ/ответ всем: поля редактора из выбранного письма.
+fn reply_prefill(st: &AppState, all: bool) -> Option<ComposePrefill> {
+    let uid = st.selected_uid?;
+    let hdr = st.rows.iter().find(|m| m.uid == uid)?;
+    let cc = if all {
+        let mut cc = hdr.to.clone();
+        if !hdr.cc.is_empty() {
+            if !cc.is_empty() {
+                cc.push_str(", ");
+            }
+            cc.push_str(&hdr.cc);
+        }
+        cc
+    } else {
+        String::new()
     };
-    unsafe {
-        SendMessageW(
-            tv,
-            TVM_INSERTITEMW,
-            None,
-            Some(LPARAM(&ins as *const TVINSERTSTRUCTW as isize)),
-        );
-    }
+    let subject = if hdr.subject.to_lowercase().starts_with("re:") {
+        hdr.subject.clone()
+    } else {
+        format!("Re: {}", hdr.subject)
+    };
+    Some(ComposePrefill {
+        to: hdr.from.clone(),
+        cc,
+        subject,
+        body: quote_body(hdr, st.pane_body.as_ref()),
+    })
+}
+
+/// Пересылка.
+fn forward_prefill(st: &AppState) -> Option<ComposePrefill> {
+    let uid = st.selected_uid?;
+    let hdr = st.rows.iter().find(|m| m.uid == uid)?;
+    let subject = if hdr.subject.to_lowercase().starts_with("fwd:") {
+        hdr.subject.clone()
+    } else {
+        format!("Fwd: {}", hdr.subject)
+    };
+    Some(ComposePrefill {
+        to: String::new(),
+        cc: String::new(),
+        subject,
+        body: quote_body(hdr, st.pane_body.as_ref()),
+    })
+}
+
+/// Выбранное письмо (для удаления/переключения флага).
+fn selected_header(st: &AppState) -> Option<mail::imap::MessageHeader> {
+    let uid = st.selected_uid?;
+    st.rows.iter().find(|m| m.uid == uid).cloned()
 }
 
 unsafe extern "system" fn wndproc(
@@ -320,7 +302,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_GETMINMAXINFO => {
             let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize = POINT { x: 960, y: 600 };
+            mmi.ptMinTrackSize = POINT { x: 1000, y: 620 };
             LRESULT(0)
         }
         WM_SIZE => {
@@ -328,39 +310,179 @@ unsafe extern "system" fn wndproc(
             unsafe { layout(hwnd, st) };
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        WM_COMMAND => {
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            let id = (wparam.0 & 0xFFFF) as u16;
+            // Команды меню (lparam == 0); от контролов — в их собственных wndproc.
+            if lparam.0 != 0 {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            match id {
+                IDM_EXIT => {
+                    let _ = unsafe { DestroyWindow(hwnd) };
+                }
+                IDM_ACCOUNT_ADD => {
+                    if let Some(h) = account_dlg::open(hwnd, st) {
+                        st.hwnd_account = Some(h);
+                    }
+                }
+                IDM_SYNC => {
+                    if let Some(key) = st.current_folder.clone() {
+                        status_text(st, "синхронизация...");
+                        if let Some(b) = &st.backend {
+                            b.post(Job::SyncFolder { key });
+                        }
+                    } else {
+                        status_text(st, "сначала выберите папку");
+                    }
+                }
+                IDM_COMPOSE => {
+                    if st.accounts.is_empty() {
+                        unsafe {
+                            MessageBoxW(
+                                Some(hwnd),
+                                w!("Сначала добавьте почтовый ящик."),
+                                w!("POS Mail"),
+                                MB_OK | MB_ICONINFORMATION,
+                            );
+                        }
+                        if let Some(h) = account_dlg::open(hwnd, st) {
+                            st.hwnd_account = Some(h);
+                        }
+                    } else if let Some(h) = compose::open(hwnd, st, None) {
+                        st.hwnd_compose = Some(h);
+                    }
+                }
+                IDM_REPLY | IDM_REPLY_ALL => {
+                    match reply_prefill(st, id == IDM_REPLY_ALL) {
+                        Some(p) => {
+                            if let Some(h) = compose::open(hwnd, st, Some(p)) {
+                                st.hwnd_compose = Some(h);
+                            }
+                        }
+                        None => status_text(st, "сначала выберите письмо"),
+                    }
+                }
+                IDM_FORWARD => match forward_prefill(st) {
+                    Some(p) => {
+                        if let Some(h) = compose::open(hwnd, st, Some(p)) {
+                            st.hwnd_compose = Some(h);
+                        }
+                    }
+                    None => status_text(st, "сначала выберите письмо"),
+                },
+                IDM_DELETE => {
+                    let Some(hdr) = selected_header(st) else {
+                        status_text(st, "сначала выберите письмо");
+                        return LRESULT(0);
+                    };
+                    let answer = unsafe {
+                        MessageBoxW(
+                            Some(hwnd),
+                            w!("Удалить письмо (перенести в корзину сервера)?"),
+                            w!("POS Mail"),
+                            MB_YESNO | MB_ICONINFORMATION,
+                        )
+                    };
+                    if answer == windows::Win32::UI::WindowsAndMessaging::IDYES {
+                        let key = st.current_folder.clone().unwrap_or_default();
+                        if !key.is_empty() {
+                            if let Some(b) = &st.backend {
+                                b.post(Job::DeleteMessage { key, uid: hdr.uid });
+                            }
+                        }
+                    }
+                }
+                IDM_TOGGLE_SEEN => {
+                    let Some(hdr) = selected_header(st) else {
+                        status_text(st, "сначала выберите письмо");
+                        return LRESULT(0);
+                    };
+                    let key = st.current_folder.clone().unwrap_or_default();
+                    if !key.is_empty() {
+                        if let Some(b) = &st.backend {
+                            b.post(Job::SetSeen {
+                                key,
+                                uid: hdr.uid,
+                                seen: !hdr.seen,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
         WM_NOTIFY => {
             let hdr = unsafe { &*(lparam.0 as *const NMHDR) };
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
-            if hdr.hwndFrom == st.hwnd_list && hdr.code == LVN_GETDISPINFOW {
-                let nm = unsafe { &mut *(lparam.0 as *mut NMLVDISPINFOW) };
-                let i = nm.item.iItem as usize;
-                if nm.item.mask.contains(LVIF_TEXT) && i < st.rows.len() {
-                    let row = &st.rows[i];
-                    let text = match nm.item.iSubItem {
-                        0 => row.from.as_str(),
-                        1 => row.subject.as_str(),
-                        _ => row.date.as_str(),
-                    };
-                    copy_utf16(nm.item.pszText, nm.item.cchTextMax, text);
-                }
-                return LRESULT(0);
-            }
-            if hdr.hwndFrom == st.hwnd_list && hdr.code == NM_DBLCLK {
-                let nm = unsafe { &*(lparam.0 as *const NMITEMACTIVATE) };
-                if nm.iItem >= 0 {
-                    let i = nm.iItem as usize;
-                    if let Some(row) = st.rows.get(i) {
-                        if let Some(wv) = &st.webview {
-                            let _ = unsafe {
-                                wv.NavigateToString(&HSTRING::from(letter_html(row)))
-                            };
-                        }
-                        unsafe { status_text(st, &format!("Открыто: {}", row.subject)) };
+            if hdr.hwndFrom == st.hwnd_list {
+                match hdr.code {
+                    LVN_GETDISPINFOW => {
+                        let nm = unsafe { &mut *(lparam.0 as *mut NMLVDISPINFOW) };
+                        on_get_disp_info(st, nm);
+                        return LRESULT(0);
                     }
+                    NM_CUSTOMDRAW => {
+                        let nm = unsafe { &*(lparam.0 as *const windows::Win32::UI::Controls::NMCUSTOMDRAW) };
+                        return on_list_custom_draw(st, nm);
+                    }
+                    windows::Win32::UI::Controls::LVN_ITEMCHANGED => {
+                        let nm = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
+                        on_list_item_changed(st, nm);
+                        return LRESULT(0);
+                    }
+                    _ => {}
                 }
+            } else if hdr.hwndFrom == st.hwnd_tree && hdr.code == TVN_SELCHANGEDW {
+                let nm = unsafe { &*(lparam.0 as *const NMTREEVIEWW) };
+                on_tree_select(st.hwnd_list, st, nm);
                 return LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_APP_MAIL => {
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            if let Some(b) = &st.backend {
+                for ev in b.drain() {
+                    apply_mail_event(hwnd, st.hwnd_list, st.hwnd_tree, st, ev);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_ATTACH_CLICK => {
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            let index = lparam.0 as u32;
+            let Some(uid) = st.selected_uid else {
+                return LRESULT(0);
+            };
+            let Some(key) = st.current_folder.clone() else {
+                return LRESULT(0);
+            };
+            if let Some(b) = &st.backend {
+                b.post(Job::SaveAttachment { key, uid, index });
+                status_text(st, "сохраняю вложение...");
+            }
+            LRESULT(0)
+        }
+        WM_APP_COMPOSE_CLOSED => {
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            st.hwnd_compose = None;
+            LRESULT(0)
+        }
+        WM_APP_ACCOUNT_SAVED => {
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            rebuild_tree(st.hwnd_tree, st);
+            LRESULT(0)
+        }
+        WM_APP_ACCOUNT_CLOSED => {
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            st.hwnd_account = None;
+            LRESULT(0)
+        }
+        WM_APP_SEND_RESULT => {
+            // Приходит только окну редактора; сюда не должен попадать.
+            LRESULT(0)
         }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
@@ -390,6 +512,8 @@ fn run() -> Result<()> {
         });
     }
 
+    let (font, font_bold) = create_fonts();
+
     let hmod = unsafe { GetModuleHandleW(None)? };
     let wc = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,
@@ -404,19 +528,17 @@ fn run() -> Result<()> {
     }
 
     // Состояние уходит в GWLP_USERDATA через CREATESTRUCTW (WM_NCCREATE).
-    // Владение сознательно передаётся окну: приложение однопоточное, живёт
-    // до выхода — для шипа освобождение не критично.
-    let state = Box::into_raw(Box::new(AppState::new(make_rows(ROWS))));
+    let state = Box::into_raw(Box::new(AppState::new(font, font_bold)));
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             WINDOW_CLASS,
-            w!("POS Mail — нативная оболочка (Фаза 0)"),
+            w!("POS Mail — Фаза 1: почтовый каркас"),
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            1280,
-            800,
+            1440,
+            900,
             None,
             None,
             Some(windows::Win32::Foundation::HINSTANCE(hmod.0)),
@@ -447,72 +569,53 @@ fn run() -> Result<()> {
     st.hwnd_tree = child(WC_TREEVIEW, WINDOW_STYLE(0))?;
     st.hwnd_list = child(
         WC_LISTVIEW,
-        WINDOW_STYLE(
-            LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS,
-        ),
+        WINDOW_STYLE(LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS),
     )?;
     st.hwnd_status = child(STATUSBAR_CLASS, WINDOW_STYLE(0))?;
 
-    // Шрифт по умолчанию всем детям.
-    let hfont = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+    // Шрифт интерфейса всем детям (системный, подобранный под DPI).
     for h in [st.hwnd_tree, st.hwnd_list, st.hwnd_status] {
         unsafe {
-            SendMessageW(h, WM_SETFONT, Some(WPARAM(hfont.0 as usize)), Some(LPARAM(1)));
+            SendMessageW(h, WM_SETFONT, Some(WPARAM(st.font.0 as usize)), Some(LPARAM(1)));
         }
     }
 
-    // Колонки и режим виртуального списка.
-    unsafe {
-        lv_column(st.hwnd_list, 0, "От", 260);
-        lv_column(st.hwnd_list, 1, "Тема", 480);
-        lv_column(st.hwnd_list, 2, "Дата", 150);
-        SendMessageW(
-            st.hwnd_list,
-            LVM_SETEXTENDEDLISTVIEWSTYLE,
-            Some(WPARAM(0)),
-            Some(LPARAM(
-                (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize
-            )),
-        );
-        SendMessageW(
-            st.hwnd_list,
-            LVM_SETITEMCOUNT,
-            Some(WPARAM(st.rows.len())),
-            None,
-        );
-    }
+    setup_list_columns(st.hwnd_list);
 
-    // Дерево папок.
-    unsafe {
-        tv_insert(st.hwnd_tree, TVI_ROOT, "Входящие");
-        tv_insert(st.hwnd_tree, TVI_ROOT, "Отправленные");
-        tv_insert(st.hwnd_tree, TVI_ROOT, "Черновики");
-        tv_insert(st.hwnd_tree, TVI_ROOT, "Корзина");
-        tv_insert(st.hwnd_tree, TVI_ROOT, "Архив");
-        tv_insert(st.hwnd_tree, TVI_ROOT, "Спам");
-    }
+    // Меню + ускорители.
+    let haccel = create_menu(hwnd)?;
 
-    // Панель письма: WebView2.
+    // Панель письма: WebView2 (единственный движок в оболочке).
+    let backend = Backend::spawn(hwnd);
     let (controller, webview) = unsafe { create_webview(hwnd)? };
     st.controller = Some(controller);
     st.webview = Some(webview);
-    if let Some(row) = st.rows.first() {
-        unsafe {
-            let _ = st
-                .webview
-                .as_ref()
-                .unwrap()
-                .NavigateToString(&HSTRING::from(letter_html(row)));
+    if let Some(wv) = &st.webview {
+        let _ = unsafe { wv.NavigateToString(&HSTRING::from(empty_pane_html())) };
+    }
+    st.backend = Some(backend);
+
+    // Дерево ящиков/папок + выбор первого INBOX (загрузка из кэша — мгновенно).
+    rebuild_tree(st.hwnd_tree, st);
+    if st.accounts.is_empty() {
+        status_text(
+            st,
+            "ящики не настроены: меню «Ящики → Добавить ящик» (accounts.json общий с Soroka)",
+        );
+    } else if let Some(key) = st.current_folder.clone() {
+        status_text(st, "синхронизация...");
+        if let Some(b) = &st.backend {
+            b.post(Job::SyncFolder { key });
         }
     }
 
     unsafe {
         layout(hwnd, st);
-        status_text(st, "50 000 писем в виртуальном списке — тяни край окна");
         let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetFocus(Some(st.hwnd_list));
     }
 
-    // Цикл сообщений.
+    // Цикл сообщений (ускорители — до TranslateMessage).
     let mut msg = MSG::default();
     loop {
         let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
@@ -520,8 +623,10 @@ fn run() -> Result<()> {
             break;
         }
         unsafe {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            if TranslateAcceleratorW(Some(hwnd), haccel, &mut msg) == 0 {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
     unsafe { CoUninitialize() };
