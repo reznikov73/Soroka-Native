@@ -30,7 +30,7 @@ use webview2_com::{
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 use windows::Win32::Foundation::{
-    E_POINTER, E_UNEXPECTED, GetClientRect, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    E_POINTER, E_UNEXPECTED, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetStockObject, PAINTSTRUCT, DEFAULT_GUI_FONT,
@@ -41,19 +41,20 @@ use windows::Win32::UI::Controls::{
     HTREEITEM, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX,
     InitCommonControlsEx, LVCOLUMNW, LVIF_TEXT, LVM_INSERTCOLUMNW, LVM_SETITEMCOUNT,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVN_GETDISPINFOW, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NMLVDISPINFOW, NMITEMACTIVATE, TVIF_TEXT,
-    TVINSERTSTRUCTW, TVI_LAST, TVI_ROOT, TVITEMW, TVM_INSERTITEMW, WC_LISTVIEW, WC_TREEVIEW,
+    LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NM_DBLCLK, NMHDR, NMLVDISPINFOW,
+    NMITEMACTIVATE, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVI_LAST, TVI_ROOT, TVITEMW,
+    TVM_INSERTITEMW, WC_LISTVIEW, WC_TREEVIEW,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, DefWindowProcW, DispatchMessageW,
-    GetMessageW, GWLP_USERDATA, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MINMAXINFO, MSG,
-    NM_DBLCLK, NMHDR, PostQuitMessage, RegisterClassW, SWP_NOZORDER, SW_SHOW, SendMessageW,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_DESTROY, WM_GETMINMAXINFO, WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE,
-    WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+    DispatchMessageW, GetClientRect, GetMessageW, GWLP_USERDATA, GetWindowLongPtrW, IDC_ARROW,
+    LoadCursorW, MINMAXINFO, MSG, PostQuitMessage, RegisterClassW, SWP_NOZORDER, SW_SHOW,
+    SendMessageW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_DESTROY, WM_GETMINMAXINFO, WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_SETFONT,
+    WM_SIZE, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 /// Сообщение статус-бара (SB_SETTEXTW из commctrl: WM_USER + 11).
@@ -207,15 +208,24 @@ unsafe fn status_text(st: &AppState, text: &str) {
     }
 }
 
+/// `webview2-com` 0.39 отдаёт собственный `Error`; `From` в `windows::core::Error`
+/// нет — приводим вручную.
+fn wv_err(err: webview2_com::Error) -> Error {
+    match err {
+        webview2_com::Error::WindowsError(e) => e,
+        other => Error::new(E_UNEXPECTED, other.to_string()),
+    }
+}
+
 /// Создание WebView2 (среда + контроллер) на родительском окне.
 /// Паттерн — как в wry 0.57: замыкания-обработчики + wait_with_pump.
 unsafe fn create_webview(parent: HWND) -> Result<(ICoreWebView2Controller, ICoreWebView2)> {
     let (tx, rx) = mpsc::channel();
     let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
         move |error_code: Result<()>, environment: Option<ICoreWebView2Environment>| -> Result<()> {
-            let env = (|| {
+            let env: Result<ICoreWebView2Environment> = (|| {
                 error_code?;
-                environment.ok_or_else(|| Error::from(E_POINTER).into())
+                environment.ok_or_else(|| Error::from(E_POINTER))
             })();
             tx.send(env).map_err(|_| Error::from(E_UNEXPECTED))
         },
@@ -229,21 +239,24 @@ unsafe fn create_webview(parent: HWND) -> Result<(ICoreWebView2Controller, ICore
             &env_handler,
         )?;
     }
-    let env = wait_with_pump(rx)?;
+    let env = wait_with_pump(rx).map_err(wv_err)??;
 
     let (tx2, rx2) = mpsc::channel();
     let ctrl_handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
         move |error_code: Result<()>, controller: Option<ICoreWebView2Controller>| -> Result<()> {
-            let ctrl = (|| {
+            let ctrl: Result<ICoreWebView2Controller> = (|| {
                 error_code?;
-                controller.ok_or_else(|| Error::from(E_POINTER).into())
+                controller.ok_or_else(|| Error::from(E_POINTER))
             })();
             tx2.send(ctrl).map_err(|_| Error::from(E_UNEXPECTED))
         },
     ));
     unsafe { env.CreateCoreWebView2Controller(parent, &ctrl_handler)? };
-    let controller = wait_with_pump(rx2)?;
-    let webview = unsafe { controller.GetWebView()? };
+    let controller = wait_with_pump(rx2).map_err(wv_err)??;
+    let webview = unsafe { controller.CoreWebView2()? };
+    // Контроллер приходит скрытым (IsVisible=false): без явного показа панель
+    // остаётся чёрной — проверено на 157.0.4341.46.
+    unsafe { controller.SetIsVisible(true)? };
     Ok((controller, webview))
 }
 
@@ -272,11 +285,13 @@ unsafe fn tv_insert(tv: HWND, parent: HTREEITEM, text: &str) {
     let ins = TVINSERTSTRUCTW {
         hParent: parent,
         hInsertAfter: TVI_LAST,
-        item: TVITEMW {
-            mask: TVIF_TEXT,
-            pszText: windows::core::PWSTR(buf.as_mut_ptr()),
-            cchTextMax: buf.len() as i32,
-            ..Default::default()
+        Anonymous: TVINSERTSTRUCTW_0 {
+            item: TVITEMW {
+                mask: TVIF_TEXT,
+                pszText: windows::core::PWSTR(buf.as_mut_ptr()),
+                cchTextMax: buf.len() as i32,
+                ..Default::default()
+            },
         },
     };
     unsafe {
@@ -314,10 +329,10 @@ unsafe extern "system" fn wndproc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_NOTIFY => {
-            let hdr = unsafe { &*(lparam as *const NMHDR) };
+            let hdr = unsafe { &*(lparam.0 as *const NMHDR) };
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             if hdr.hwndFrom == st.hwnd_list && hdr.code == LVN_GETDISPINFOW {
-                let nm = unsafe { &mut *(lparam as *mut NMLVDISPINFOW) };
+                let nm = unsafe { &mut *(lparam.0 as *mut NMLVDISPINFOW) };
                 let i = nm.item.iItem as usize;
                 if nm.item.mask.contains(LVIF_TEXT) && i < st.rows.len() {
                     let row = &st.rows[i];
@@ -331,7 +346,7 @@ unsafe extern "system" fn wndproc(
                 return LRESULT(0);
             }
             if hdr.hwndFrom == st.hwnd_list && hdr.code == NM_DBLCLK {
-                let nm = unsafe { &*(lparam as *const NMITEMACTIVATE) };
+                let nm = unsafe { &*(lparam.0 as *const NMITEMACTIVATE) };
                 if nm.iItem >= 0 {
                     let i = nm.iItem as usize;
                     if let Some(row) = st.rows.get(i) {
@@ -351,7 +366,7 @@ unsafe extern "system" fn wndproc(
             let mut ps = PAINTSTRUCT::default();
             unsafe {
                 BeginPaint(hwnd, &mut ps);
-                EndPaint(hwnd, &ps);
+                let _ = EndPaint(hwnd, &ps);
             }
             LRESULT(0)
         }
@@ -366,10 +381,10 @@ unsafe extern "system" fn wndproc(
 fn run() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED)?;
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
     }
     unsafe {
-        InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+        let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES,
         });
@@ -433,7 +448,7 @@ fn run() -> Result<()> {
     st.hwnd_list = child(
         WC_LISTVIEW,
         WINDOW_STYLE(
-            LVS_REPORT.0 as u32 | LVS_OWNERDATA.0 as u32 | LVS_SHOWSELALWAYS.0 as u32,
+            LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS,
         ),
     )?;
     st.hwnd_status = child(STATUSBAR_CLASS, WINDOW_STYLE(0))?;
@@ -456,7 +471,7 @@ fn run() -> Result<()> {
             LVM_SETEXTENDEDLISTVIEWSTYLE,
             Some(WPARAM(0)),
             Some(LPARAM(
-                (LVS_EX_FULLROWSELECT.0 | LVS_EX_DOUBLEBUFFER.0) as isize
+                (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize
             )),
         );
         SendMessageW(
@@ -494,7 +509,7 @@ fn run() -> Result<()> {
     unsafe {
         layout(hwnd, st);
         status_text(st, "50 000 писем в виртуальном списке — тяни край окна");
-        ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, SW_SHOW);
     }
 
     // Цикл сообщений.
