@@ -22,7 +22,8 @@ mod compose;
 // Часть его API (контакты, IDLE, пресеты провайдеров) подключается в Фазах 2–3 —
 // до тех пор dead_code на модуле неинформативен. Снять allow вместе с подключением
 // соответствующих API (TASK-N02, v0.2.2).
-#[allow(dead_code)]
+// needless_borrow — то же самое: два места в imap.rs (726–727), ядро не правим.
+#[allow(dead_code, clippy::needless_borrow)]
 mod mail;
 mod state;
 mod ui;
@@ -393,10 +394,8 @@ unsafe extern "system" fn wndproc(
                     };
                     if answer == windows::Win32::UI::WindowsAndMessaging::IDYES {
                         let key = st.current_folder.clone().unwrap_or_default();
-                        if !key.is_empty() {
-                            if let Some(b) = &st.backend {
-                                b.post(Job::DeleteMessage { key, uid: hdr.uid });
-                            }
+                        if !key.is_empty() && let Some(b) = &st.backend {
+                            b.post(Job::DeleteMessage { key, uid: hdr.uid });
                         }
                     }
                 }
@@ -406,14 +405,12 @@ unsafe extern "system" fn wndproc(
                         return LRESULT(0);
                     };
                     let key = st.current_folder.clone().unwrap_or_default();
-                    if !key.is_empty() {
-                        if let Some(b) = &st.backend {
-                            b.post(Job::SetSeen {
-                                key,
-                                uid: hdr.uid,
-                                seen: !hdr.seen,
-                            });
-                        }
+                    if !key.is_empty() && let Some(b) = &st.backend {
+                        b.post(Job::SetSeen {
+                            key,
+                            uid: hdr.uid,
+                            seen: !hdr.seen,
+                        });
                     }
                 }
                 _ => {}

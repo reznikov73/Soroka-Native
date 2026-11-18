@@ -9,7 +9,10 @@ use crate::mail::accounts::Account;
 use crate::mail::imap::MessageHeader;
 
 /// Узел дерева папок: либо заголовок ящика, либо папка с ключом «id::ИМЯ».
+// id/email и name заполняются при построении дерева, но UI пока работает по ключу
+// «account::folder». Понадобятся в Фазе 3 (контакты/подписи) — поля не удаляем.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum TreeSlot {
     Account { id: String, email: String },
     Folder { key: String, name: String },

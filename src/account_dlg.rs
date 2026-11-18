@@ -131,6 +131,8 @@ unsafe fn st_of(hwnd: HWND) -> Option<&'static mut AccountState> {
     }
 }
 
+// 9 параметров — обычная сигнатура CreateWindowExW; разбивать ради линта не будем.
+#[allow(clippy::too_many_arguments)]
 unsafe fn child(
     parent: HWND,
     class: PCWSTR,
@@ -143,7 +145,7 @@ unsafe fn child(
     id: i32,
 ) -> HWND {
     let hmod = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
-    let mut text_buf = text.map(|t| wide(t));
+    let mut text_buf = text.map(wide);
     let text_ptr = match text_buf.as_mut() {
         Some(b) => PCWSTR(b.as_mut_ptr()),
         None => PCWSTR::null(),

@@ -81,8 +81,10 @@ pub fn status_text(st: &AppState, text: &str) {
 /// NONCLIENTMETRICS даёт правильный шрифт под DPI и тему системы.
 pub fn create_fonts() -> (HFONT, HFONT) {
     unsafe {
-        let mut metrics = NONCLIENTMETRICSW::default();
-        metrics.cbSize = std::mem::size_of::<NONCLIENTMETRICSW>() as u32;
+        let mut metrics = NONCLIENTMETRICSW {
+            cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+            ..Default::default()
+        };
         let ok = windows::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
             windows::Win32::UI::WindowsAndMessaging::SPI_GETNONCLIENTMETRICS,
             metrics.cbSize,
@@ -290,7 +292,7 @@ pub fn rebuild_tree(hwnd_tv: HWND, st: &mut AppState) {
             hwnd_tv,
             TVM_DELETEITEM,
             Some(WPARAM(0)),
-            Some(LPARAM(TVI_ROOT.0 as isize)),
+            Some(LPARAM(TVI_ROOT.0)),
         );
     }
     let mut first_inbox: Option<HTREEITEM> = None;
@@ -340,7 +342,7 @@ pub fn rebuild_tree(hwnd_tv: HWND, st: &mut AppState) {
                 hwnd_tv,
                 TVM_EXPAND,
                 Some(WPARAM(TVE_EXPAND.0 as usize)),
-                Some(LPARAM(h_acc.0 as isize)),
+                Some(LPARAM(h_acc.0)),
             );
         }
     }
@@ -350,7 +352,7 @@ pub fn rebuild_tree(hwnd_tv: HWND, st: &mut AppState) {
                 hwnd_tv,
                 TVM_SELECTITEM,
                 Some(WPARAM(TVGN_CARET as usize)),
-                Some(LPARAM(h.0 as isize)),
+                Some(LPARAM(h.0)),
             );
         }
     }
@@ -426,7 +428,7 @@ pub fn on_list_custom_draw(st: &AppState, nm: &NMCUSTOMDRAW) -> LRESULT {
     match nm.dwDrawStage {
         CDDS_PREPAINT => LRESULT(CDRF_NOTIFYITEMDRAW as isize),
         stage if stage.0 & CDDS_ITEMPREPAINT.0 != 0 => {
-            let i = nm.dwItemSpec as usize;
+            let i = nm.dwItemSpec;
             let bold = st.rows.get(i).is_some_and(|m| !m.seen);
             let hfont = if bold { st.font_bold } else { st.font };
             unsafe {
@@ -589,10 +591,8 @@ pub fn show_body(st: &mut AppState, key: &str, uid: u32, from_cache: bool, body:
         ),
     );
     // Прочитано — на сервер и в кэш (как set_seen в Soroka).
-    if was_unread {
-        if let Some(b) = &st.backend {
-            b.post(crate::backend::Job::SetSeen { key: key.to_string(), uid, seen: true });
-        }
+    if was_unread && let Some(b) = &st.backend {
+        b.post(crate::backend::Job::SetSeen { key: key.to_string(), uid, seen: true });
     }
 }
 
@@ -706,9 +706,9 @@ pub fn apply_mail_event(
 /// rebuild_tree с восстановлением выбранной папки.
 fn rebuild_tree_keep(hwnd_tv: HWND, hwnd_list: HWND, st: &mut AppState, sel: Option<String>) {
     rebuild_tree(hwnd_tv, st);
-    if let Some(key) = sel {
-        if st.tree_slots.iter().any(|s| matches!(s, TreeSlot::Folder { key: k, .. } if *k == key)) {
-            show_folder(hwnd_list, st, &key);
-        }
+    if let Some(key) = sel
+        && st.tree_slots.iter().any(|s| matches!(s, TreeSlot::Folder { key: k, .. } if *k == key))
+    {
+        show_folder(hwnd_list, st, &key);
     }
 }

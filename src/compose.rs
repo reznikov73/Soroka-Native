@@ -167,6 +167,8 @@ unsafe fn st_of(hwnd: HWND) -> Option<&'static mut ComposeState> {
 }
 
 /// Создание дочернего контрола (координаты уточнит layout()).
+// 9 параметров — обычная сигнатура CreateWindowExW; разбивать ради линта не будем.
+#[allow(clippy::too_many_arguments)]
 unsafe fn child(
     parent: HWND,
     class: PCWSTR,
@@ -179,7 +181,7 @@ unsafe fn child(
     id: i32,
 ) -> HWND {
     let hmod = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
-    let mut text_buf = text.map(|t| wide(t));
+    let mut text_buf = text.map(wide);
     let text_ptr = match text_buf.as_mut() {
         Some(b) => PCWSTR(b.as_mut_ptr()),
         None => PCWSTR::null(),
@@ -580,12 +582,10 @@ unsafe fn on_attach(hwnd: HWND) {
         });
     }
     refresh_attach_list(st);
-    unsafe {
-        let _ = set_text(
-            st.hwnd_status,
-            &format!("прикреплено файлов: {}", st.atts.len()),
-        );
-    }
+    let _ = set_text(
+        st.hwnd_status,
+        &format!("прикреплено файлов: {}", st.atts.len()),
+    );
 }
 
 /// MIME-тип по расширению (для исходящих вложений).

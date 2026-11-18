@@ -71,6 +71,9 @@ pub enum MailEvent {
     /// Синхронизация папки завершилась (успешно или с ошибкой сети).
     SyncDone {
         key: String,
+        // Пока не читается UI (дерево живёт по ключу), но нужно для точечного
+        // обновления счётчиков по ящику — Фаза 2.
+        #[allow(dead_code)]
         account_id: String,
         total: u32,
         fetched: u32,
@@ -113,6 +116,8 @@ pub struct BodyData {
 /// Результат отправки для окна написания (WM_APP_SEND_RESULT).
 pub struct SendOutcome {
     pub ok: bool,
+    // Признак «письмо ушло в очередь» (TASK-089): UI пока показывает msg целиком.
+    #[allow(dead_code)]
     pub queued: bool,
     pub msg: String,
 }
