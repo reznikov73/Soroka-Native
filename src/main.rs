@@ -18,6 +18,11 @@ mod account_dlg;
 mod ai;
 mod backend;
 mod compose;
+// Ядро Soroka перенесено дословно (правило WORKFLOW: src/mail/ не редактировать).
+// Часть его API (контакты, IDLE, пресеты провайдеров) подключается в Фазах 2–3 —
+// до тех пор dead_code на модуле неинформативен. Снять allow вместе с подключением
+// соответствующих API (TASK-N02, v0.2.2).
+#[allow(dead_code)]
 mod mail;
 mod state;
 mod ui;

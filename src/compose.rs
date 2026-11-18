@@ -464,7 +464,7 @@ unsafe extern "system" fn wndproc(
                         return LRESULT(0);
                     }
                     IDC_BTN_CANCEL => {
-                        unsafe { DestroyWindow(hwnd) };
+                        let _ = unsafe { DestroyWindow(hwnd) };
                         return LRESULT(0);
                     }
                     _ => {}
@@ -485,7 +485,7 @@ unsafe extern "system" fn wndproc(
                         w!("POS Mail"),
                         MB_OK | MB_ICONINFORMATION,
                     );
-                    DestroyWindow(hwnd);
+                    let _ = DestroyWindow(hwnd);
                 }
             } else {
                 st.sending = false;
@@ -502,7 +502,7 @@ unsafe extern "system" fn wndproc(
         WM_DESTROY => {
             if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                         Some(st.parent),
                         WM_APP_COMPOSE_CLOSED,
                         WPARAM(0),
