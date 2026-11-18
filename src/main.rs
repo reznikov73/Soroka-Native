@@ -18,6 +18,7 @@ mod account_dlg;
 mod ai;
 mod backend;
 mod compose;
+mod layout_store;
 // Ядро Soroka перенесено дословно (правило WORKFLOW: src/mail/ не редактировать).
 // Часть его API (контакты, IDLE, пресеты провайдеров) подключается в Фазах 2–3 —
 // до тех пор dead_code на модуле неинформативен. Снять allow вместе с подключением
@@ -70,11 +71,12 @@ use backend::{Backend, Job, WM_APP_MAIL, WM_APP_SEND_RESULT};
 use compose::{ComposePrefill, WM_APP_COMPOSE_CLOSED};
 use state::AppState;
 use ui::{
-    EN_CHANGE, IDT_SEARCH, PANE_W, SEARCH_H, STATUS_H, TREE_W, apply_mail_event, create_fonts,
-    create_menu, empty_pane_html, enter_search, exit_search, fire_search, on_get_disp_info,
-    on_list_custom_draw, on_list_item_changed, on_tree_select, rebuild_tree, setup_list_columns,
-    status_text, IDM_ACCOUNT_ADD, IDM_COMPOSE, IDM_DELETE, IDM_EXIT, IDM_FORWARD, IDM_REPLY,
-    IDM_REPLY_ALL, IDM_SEARCH_CLOSE, IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SYNC, IDM_TOGGLE_SEEN,
+    EN_CHANGE, IDT_SEARCH, PANE_MIN, SEARCH_H, SPLIT_W, SplitCtx, STATUS_H, apply_mail_event,
+    create_fonts, create_menu, empty_pane_html, enter_search, exit_search, fire_search,
+    on_get_disp_info, on_list_custom_draw, on_list_item_changed, on_tree_select, rebuild_tree,
+    register_splitter_class, setup_list_columns, status_text, IDM_ACCOUNT_ADD, IDM_COMPOSE,
+    IDM_DELETE, IDM_EXIT, IDM_FORWARD, IDM_REPLY, IDM_REPLY_ALL, IDM_SEARCH_CLOSE,
+    IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SYNC, IDM_TOGGLE_SEEN,
 };
 
 const WINDOW_CLASS: PCWSTR = w!("SorokaNativeWnd");
@@ -85,8 +87,11 @@ const EM_SETCUEBANNER: u32 = 0x1501;
 /// Клик по вложению в панели письма (WebView2 → оболочка): lparam = индекс.
 const WM_APP_ATTACH_CLICK: u32 = WM_APP_ACCOUNT_CLOSED + 1;
 
-/// Раскладка панелей (как в Фазе 0, но с учетом статуса, поиска и новой ширины панели).
-unsafe fn layout(hwnd: HWND, st: &AppState) {
+/// Раскладка панелей (TASK-N04): дерево | сплиттер | список | сплиттер | тело.
+/// Ширины считаются из весов (аналог flex-grow в Soroka), минимум панели —
+/// 110px; на время жеста сплиттера (st.dragging) SetBounds панели письма
+/// отложен — WebView2 не участвует в кадре жеста.
+unsafe fn layout(hwnd: HWND, st: &mut AppState) {
     let mut rc = RECT::default();
     if unsafe { GetClientRect(hwnd, &mut rc) }.is_err() {
         return;
@@ -97,43 +102,83 @@ unsafe fn layout(hwnd: HWND, st: &AppState) {
     // Поле поиска (TASK-N03) занимает полосу над списком.
     let search_open = st.search_query.is_some();
     let list_top = if search_open { SEARCH_H } else { 0 };
-    let list_w = (w - TREE_W - PANE_W).max(160);
+
+    // Ширины из весов (dragSplit Soroka: сумма весов пары сохраняется).
+    let content = (w - 2 * SPLIT_W).max(0);
+    let total = st.wf + st.wl + st.wr;
+    let mut tree_px = if total > 0.0 {
+        ((content as f64) * st.wf / total).round() as i32
+    } else {
+        PANE_MIN
+    };
+    tree_px = tree_px.clamp(PANE_MIN, (content - 2 * PANE_MIN).max(PANE_MIN));
+    let mut pane_px = if total > 0.0 {
+        ((content as f64) * st.wr / total).round() as i32
+    } else {
+        PANE_MIN
+    };
+    pane_px = pane_px.clamp(PANE_MIN, (content - tree_px - PANE_MIN).max(PANE_MIN));
+    let list_px = (content - tree_px - pane_px).max(PANE_MIN);
+    st.tree_px = tree_px;
+    st.list_px = list_px;
+    st.pane_px = pane_px;
+
+    let x_split_tree = tree_px;
+    let x_list = tree_px + SPLIT_W;
+    let x_split_pane = x_list + list_px;
+    let x_pane = x_split_pane + SPLIT_W;
+
     unsafe {
-        if !st.hwnd_tree.0.is_null() {
-            let _ = SetWindowPos(st.hwnd_tree, None, 0, 0, TREE_W, h_main, SWP_NOZORDER);
-        }
+        let _ = SetWindowPos(st.hwnd_tree, None, 0, 0, tree_px, h_main, SWP_NOZORDER);
         if search_open && !st.hwnd_search.0.is_null() {
             let _ = SetWindowPos(
                 st.hwnd_search,
                 None,
-                TREE_W,
+                x_list,
                 2,
-                list_w,
+                list_px,
                 SEARCH_H - 4,
                 SWP_NOZORDER,
             );
         }
-        if !st.hwnd_list.0.is_null() {
-            let _ = SetWindowPos(
-                st.hwnd_list,
-                None,
-                TREE_W,
-                list_top,
-                list_w,
-                (h_main - list_top).max(0),
-                SWP_NOZORDER,
-            );
-        }
+        let _ = SetWindowPos(
+            st.hwnd_list,
+            None,
+            x_list,
+            list_top,
+            list_px,
+            (h_main - list_top).max(0),
+            SWP_NOZORDER,
+        );
+        let _ = SetWindowPos(
+            st.hwnd_split_tree,
+            None,
+            x_split_tree,
+            0,
+            SPLIT_W,
+            h_main,
+            SWP_NOZORDER,
+        );
+        let _ = SetWindowPos(
+            st.hwnd_split_pane,
+            None,
+            x_split_pane,
+            0,
+            SPLIT_W,
+            h_main,
+            SWP_NOZORDER,
+        );
         if !st.hwnd_status.0.is_null() && h > STATUS_H {
             let _ =
                 SetWindowPos(st.hwnd_status, None, 0, h - STATUS_H, w, STATUS_H, SWP_NOZORDER);
         }
-        if let Some(ctrl) = &st.controller {
-            let left = (w - PANE_W).max(TREE_W + 160);
+        if !st.dragging
+            && let Some(ctrl) = &st.controller
+        {
             let _ = ctrl.SetBounds(RECT {
-                left,
+                left: x_pane,
                 top: 0,
-                right: left + PANE_W,
+                right: x_pane + pane_px,
                 bottom: h_main,
             });
         }
@@ -621,9 +666,20 @@ fn run() -> Result<()> {
     if unsafe { RegisterClassW(&wc) } == 0 {
         return Err(Error::from(E_UNEXPECTED));
     }
+    // Класс сплиттеров (TASK-N04).
+    register_splitter_class(hmod)?;
 
     // Состояние уходит в GWLP_USERDATA через CREATESTRUCTW (WM_NCCREATE).
     let state = Box::into_raw(Box::new(AppState::new(font, font_bold)));
+    // Веса панелей из %APPDATA%\Soroka\layout.json (TASK-N04); нет файла —
+    // дефолт как в Soroka (LAYOUT_DEFAULTS).
+    if let Some((wf, wl, wr)) = layout_store::load() {
+        unsafe {
+            (*state).wf = wf;
+            (*state).wl = wl;
+            (*state).wr = wr;
+        }
+    }
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -675,7 +731,7 @@ fn run() -> Result<()> {
             w!("EDIT"),
             None,
             WS_CHILD | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-            TREE_W,
+            0,
             2,
             400,
             SEARCH_H - 4,
@@ -683,6 +739,63 @@ fn run() -> Result<()> {
             None,
             Some(windows::Win32::Foundation::HINSTANCE(hmod.0)),
             None,
+        )?
+    };
+
+    // Сплиттеры панелей (TASK-N04): дерево|список и список|тело. Контекст —
+    // в GWLP_USERDATA через CREATESTRUCTW (как у главного окна).
+    let ctx_split_tree = Box::into_raw(Box::new(SplitCtx {
+        main: hwnd,
+        pane: false,
+        captured: false,
+        hover: false,
+        tracked: false,
+        start_x: 0,
+        start_a_px: 0,
+        sum_px: 0,
+        sum_w: 0.0,
+    }));
+    let ctx_split_pane = Box::into_raw(Box::new(SplitCtx {
+        main: hwnd,
+        pane: true,
+        captured: false,
+        hover: false,
+        tracked: false,
+        start_x: 0,
+        start_a_px: 0,
+        sum_px: 0,
+        sum_w: 0.0,
+    }));
+    st.hwnd_split_tree = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("SorokaNativeSplitter"),
+            None,
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            SPLIT_W,
+            100,
+            Some(hwnd),
+            None,
+            Some(windows::Win32::Foundation::HINSTANCE(hmod.0)),
+            Some(ctx_split_tree as *const _),
+        )?
+    };
+    st.hwnd_split_pane = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("SorokaNativeSplitter"),
+            None,
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            SPLIT_W,
+            100,
+            Some(hwnd),
+            None,
+            Some(windows::Win32::Foundation::HINSTANCE(hmod.0)),
+            Some(ctx_split_pane as *const _),
         )?
     };
 

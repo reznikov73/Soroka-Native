@@ -4,10 +4,14 @@
 //! Все функции вызываются только из UI-потока. Блокирующие операции уходят
 //! в `backend` (рабочий поток), сюда возвращаются события через WM_APP_MAIL.
 
-use windows::core::{HSTRING, PCWSTR, w};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::core::{Error, HSTRING, PCWSTR, w};
+use windows::Win32::Foundation::{
+    E_UNEXPECTED, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, InvalidateRect, LOGFONTW, SelectObject, HFONT, HGDIOBJ,
+    BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, CreateFontIndirectW,
+    EndPaint, FillRect, GetSysColorBrush, InvalidateRect, LOGFONTW, PAINTSTRUCT,
+    SelectObject, HFONT, HGDIOBJ,
 };
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
@@ -16,17 +20,23 @@ use windows::Win32::UI::Controls::{
     LVS_EX_FULLROWSELECT, LVIF_TEXT, NMCUSTOMDRAW, NMLISTVIEW, NMLVDISPINFOW,
     NMTREEVIEWW, TVGN_CARET, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW,
     TVINSERTSTRUCTW_0, TVI_LAST, TVI_ROOT, TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW,
-    TVM_SELECTITEM, TVE_EXPAND,
+    TVM_SELECTITEM, TVE_EXPAND, WM_MOUSELEAVE,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, KillTimer, MENU_ITEM_FLAGS, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, SendMessageW, SetMenu, ShowWindow, HACCEL, ACCEL,
+    AppendMenuW, CreateMenu, CreatePopupMenu, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    DefWindowProcW, GetClientRect, GetWindowLongPtrW, GWLP_USERDATA, IDC_SIZEWE, KillTimer,
+    LoadCursorW, MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR, MF_STRING, RegisterClassW,
+    SendMessageW, SetMenu, SetWindowLongPtrW, ShowWindow, HACCEL, ACCEL,
     CreateAcceleratorTableW, SW_HIDE, SW_SHOW, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY,
-    NONCLIENTMETRICSW,
+    NONCLIENTMETRICSW, WNDCLASSW, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SIZE,
 };
 
 use crate::backend::{BodyData, MailEvent};
+use crate::layout_store;
 use crate::mail::accounts::{load_accounts, split_key};
 use crate::mail::imap::MessageHeader;
 use crate::mail::store::Store;
@@ -36,12 +46,20 @@ use crate::wide::{escape_html, wide};
 /// Сообщение статус-бара (SB_SETTEXTW из commctrl: WM_USER + 11).
 pub const SB_SET_TEXT: u32 = 0x040B;
 
-/// Раскладка, px.
-pub const TREE_W: i32 = 250;
-pub const PANE_W: i32 = 470;
+/// Раскладка, px (TASK-N04): дерево | сплиттер | список | сплиттер | тело.
 pub const STATUS_H: i32 = 26;
 /// Высота полосы поиска над списком (TASK-N03).
 pub const SEARCH_H: i32 = 30;
+/// Ширина полосы сплиттера — как .splitter-v в Soroka (6px).
+pub const SPLIT_W: i32 = 6;
+/// Минимальная ширина панели при перетаскивании — clamp из dragSplit Soroka (110px).
+pub const PANE_MIN: i32 = 110;
+
+/// Веса панелей по умолчанию — LAYOUT_DEFAULTS из Soroka (окт 2026,
+/// согласовано с пользователем: узкие папки, широкое письмо).
+pub const WF_DEF: f64 = 0.2827;
+pub const WL_DEF: f64 = 1.2443;
+pub const WR_DEF: f64 = 2.023;
 
 /// Идентификаторы команд меню.
 pub const IDM_EXIT: u16 = 100;
@@ -236,6 +254,210 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
             },
         ]);
         CreateAcceleratorTableW(&accels.0)
+    }
+}
+
+// ===== Сплиттеры панелей (TASK-N04) =====
+
+/// Контекст сплиттера (в GWLP_USERDATA, живёт до конца процесса).
+pub struct SplitCtx {
+    /// Главное окно (его AppState меняем, ему шлём WM_SIZE).
+    pub main: HWND,
+    /// true — граница «список|тело» (панель письма прячется на время жеста),
+    /// false — «дерево|список».
+    pub pane: bool,
+    /// Идёт перетаскивание (мышь захвачена).
+    pub captured: bool,
+    /// Курсор над сплиттером (подсветка полосы-хвата).
+    pub hover: bool,
+    /// Запрошен ли WM_MOUSELEAVE (TrackMouseEvent).
+    pub tracked: bool,
+    /// Текущий жест: стартовый x (клиентские координаты полосы), ширина
+    /// левой панели и сумма двух соседних панелей (px и веса).
+    pub start_x: i32,
+    pub start_a_px: i32,
+    pub sum_px: i32,
+    pub sum_w: f64,
+}
+
+const SPLITTER_CLASS: PCWSTR = w!("SorokaNativeSplitter");
+
+/// Регистрация класса сплиттера (один раз из run(), до создания детей).
+pub fn register_splitter_class(hmod: HMODULE) -> windows::core::Result<()> {
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(splitter_proc),
+        hInstance: HINSTANCE(hmod.0),
+        hCursor: unsafe { LoadCursorW(None, IDC_SIZEWE)? },
+        lpszClassName: SPLITTER_CLASS,
+        ..Default::default()
+    };
+    if unsafe { RegisterClassW(&wc) } == 0 {
+        return Err(Error::from(E_UNEXPECTED));
+    }
+    Ok(())
+}
+
+/// Оконная процедура сплиттера: перетаскивание меняет веса соседних панелей
+/// (математика dragSplit из Soroka — сумма весов пары сохраняется, минимум
+/// панели 110px) и шлёт главному окну WM_SIZE: дерево и список переложиваются
+/// сразу. Bounds панели письма обновляются после жеста (layout() при
+/// st.dragging == false).
+unsafe extern "system" fn splitter_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let ctx = unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SplitCtx).as_mut() };
+    match msg {
+        WM_NCCREATE => {
+            let cs = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize) };
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_PAINT => {
+            let Some(ctx) = ctx else {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+            let mut rc = RECT::default();
+            let _ = unsafe { GetClientRect(hwnd, &mut rc) };
+            unsafe { FillRect(hdc, &rc, GetSysColorBrush(COLOR_BTNFACE)) };
+            // Полоса-хват 3×36px по центру — как .splitter-v::after в Soroka;
+            // при наведении/жесте — цвет акцента (до N05 — системный highlight).
+            let cx = (rc.left + rc.right) / 2;
+            let cy = (rc.top + rc.bottom) / 2;
+            let line = RECT {
+                left: cx - 1,
+                top: cy - 18,
+                right: cx + 2,
+                bottom: cy + 18,
+            };
+            let color = if ctx.hover || ctx.captured {
+                COLOR_HIGHLIGHT
+            } else {
+                COLOR_GRAYTEXT
+            };
+            unsafe { FillRect(hdc, &line, GetSysColorBrush(color)) };
+            let _ = unsafe { EndPaint(hwnd, &ps) };
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let Some(ctx) = ctx else {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
+            if !ctx.tracked {
+                ctx.tracked = true;
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = unsafe { TrackMouseEvent(&mut tme) };
+            }
+            if !ctx.hover {
+                ctx.hover = true;
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            }
+            if ctx.captured {
+                // dx — клиентские координаты самой полосы: capture доставляет
+                // WM_MOUSEMOVE и за пределами окна, координаты остаются корректными.
+                let x = ((lparam.0 as usize) & 0xFFFF) as u16 as i16 as i32;
+                let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
+                let pa = (ctx.start_a_px + (x - ctx.start_x))
+                    .clamp(PANE_MIN, ctx.sum_px - PANE_MIN);
+                let wa = ctx.sum_w * pa as f64 / ctx.sum_px as f64;
+                if ctx.pane {
+                    st.wl = wa;
+                    st.wr = ctx.sum_w - wa;
+                } else {
+                    st.wf = wa;
+                    st.wl = ctx.sum_w - wa;
+                }
+                st.dragging = true;
+                let _ =
+                    unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            if let Some(ctx) = ctx {
+                ctx.hover = false;
+                ctx.tracked = false;
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let Some(ctx) = ctx else {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
+            unsafe { SetCapture(hwnd) };
+            ctx.captured = true;
+            ctx.start_x = ((lparam.0 as usize) & 0xFFFF) as u16 as i16 as i32;
+            let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
+            if ctx.pane {
+                ctx.start_a_px = st.list_px;
+                ctx.sum_px = st.list_px + st.pane_px;
+                ctx.sum_w = st.wl + st.wr;
+                // Панель письма не участвует в кадре жеста: прячем до отпускания.
+                if let Some(ctrl) = &st.controller {
+                    let _ = unsafe { ctrl.SetIsVisible(false) };
+                }
+            } else {
+                ctx.start_a_px = st.tree_px;
+                ctx.sum_px = st.tree_px + st.list_px;
+                ctx.sum_w = st.wf + st.wl;
+            }
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            LRESULT(0)
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED => {
+            let Some(ctx) = ctx else {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
+            if ctx.captured {
+                ctx.captured = false;
+                if msg == WM_LBUTTONUP {
+                    let _ = unsafe { ReleaseCapture() };
+                }
+                let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
+                st.dragging = false;
+                if ctx.pane
+                    && let Some(ctrl) = &st.controller
+                {
+                    let _ = unsafe { ctrl.SetIsVisible(true) };
+                }
+                // Финальная раскладка: панель письма получает новые bounds.
+                let _ = unsafe {
+                    SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0)))
+                };
+                layout_store::save(st.wf, st.wl, st.wr);
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            let Some(ctx) = ctx else {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
+            // Сброс весов соседней пары к дефолту — как dblclick в Soroka.
+            let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
+            if ctx.pane {
+                st.wl = WL_DEF;
+                st.wr = WR_DEF;
+            } else {
+                st.wf = WF_DEF;
+                st.wl = WL_DEF;
+            }
+            let _ = unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
+            layout_store::save(st.wf, st.wl, st.wr);
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
@@ -714,13 +936,13 @@ pub fn letter_html(hdr: &MessageHeader, body: &BodyData) -> String {
     };
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><style>
-body {{ font-family: 'Segoe UI', sans-serif; background: #1c1e24; color: #d6d9e0; margin: 0; }}
-.hdr {{ padding: 14px 20px 12px; border-bottom: 1px solid #2a2d35; }}
+body {{ font-family: 'Segoe UI', sans-serif; background: #ffffff; color: #1f2937; margin: 0; }}
+.hdr {{ padding: 14px 20px 12px; border-bottom: 1px solid #e3e7ee; background: #f7f8fa; }}
 h1 {{ font-size: 17px; font-weight: 600; margin: 0 0 6px; }}
-.meta {{ color: #8b93a3; font-size: 13px; line-height: 1.5; }}
-.atts {{ padding: 8px 20px; border-bottom: 1px solid #2a2d35; font-size: 13px; color: #a9b4c9; }}
-.atts a {{ color: #6ea8ff; text-decoration: none; border-bottom: 1px dotted #6ea8ff; }}
-.warn {{ padding: 8px 20px; color: #d0a95e; font-size: 12px; border-bottom: 1px solid #2a2d35; }}
+.meta {{ color: #6b7280; font-size: 13px; line-height: 1.5; }}
+.atts {{ padding: 8px 20px; border-bottom: 1px solid #e3e7ee; font-size: 13px; color: #4b5563; }}
+.atts a {{ color: #2563eb; text-decoration: none; border-bottom: 1px dotted #2563eb; }}
+.warn {{ padding: 8px 20px; color: #92400e; font-size: 12px; border-bottom: 1px solid #e3e7ee; }}
 .body {{ padding: 16px 20px; line-height: 1.55; font-size: 14px; }}
 pre {{ white-space: pre-wrap; word-wrap: break-word; font-family: 'Segoe UI', Consolas, monospace; }}
 img {{ max-width: 100%; }}
@@ -743,7 +965,7 @@ img {{ max-width: 100%; }}
 fn loading_html(subject: &str) -> String {
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><style>
-body {{ font-family: 'Segoe UI', sans-serif; background: #1c1e24; color: #8b93a3; margin: 24px; }}
+body {{ font-family: 'Segoe UI', sans-serif; background: #f7f8fa; color: #6b7280; margin: 24px; }}
 </style></head><body>Загрузка «{}»…</body></html>"#,
         escape_html(subject)
     )
@@ -752,7 +974,7 @@ body {{ font-family: 'Segoe UI', sans-serif; background: #1c1e24; color: #8b93a3
 /// Пустая панель: папка выбрана, письмо — нет.
 pub fn empty_pane_html() -> String {
     r#"<!doctype html><html><head><meta charset="utf-8"><style>
-body { font-family: 'Segoe UI', sans-serif; background: #1c1e24; color: #8b93a3; margin: 24px; }
+body { font-family: 'Segoe UI', sans-serif; background: #f7f8fa; color: #6b7280; margin: 24px; }
 </style></head><body>Выберите письмо в списке.</body></html>"#
         .to_string()
 }

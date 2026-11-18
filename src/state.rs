@@ -7,6 +7,7 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2, ICoreWebView2
 use crate::backend::Backend;
 use crate::mail::accounts::Account;
 use crate::mail::imap::MessageHeader;
+use crate::ui::{WF_DEF, WL_DEF, WR_DEF};
 
 /// Узел дерева папок: либо заголовок ящика, либо папка с ключом «id::ИМЯ».
 // id/email и name заполняются при построении дерева, но UI пока работает по ключу
@@ -68,6 +69,21 @@ pub struct AppState {
     pub hwnd_status: HWND,
     /// Поле поиска над списком (скрыто, пока поиск не открыт) — TASK-N03.
     pub hwnd_search: HWND,
+    /// Сплиттеры панелей (TASK-N04): «дерево|список» и «список|тело».
+    pub hwnd_split_tree: HWND,
+    pub hwnd_split_pane: HWND,
+    /// Веса панелей как в Soroka (weights folders/list/reading) — TASK-N04,
+    /// хранятся в %APPDATA%\Soroka\layout.json.
+    pub wf: f64,
+    pub wl: f64,
+    pub wr: f64,
+    /// Последняя раскладка в px (для математики перетаскивания сплиттеров).
+    pub tree_px: i32,
+    pub list_px: i32,
+    pub pane_px: i32,
+    /// Идёт жест сплиттера — SetBounds панели письма отложен до отпускания
+    /// (WebView2 не участвует в кадре жеста, правило WORKFLOW).
+    pub dragging: bool,
     pub controller: Option<ICoreWebView2Controller>,
     pub webview: Option<ICoreWebView2>,
 
@@ -94,6 +110,15 @@ impl AppState {
             hwnd_list: HWND::default(),
             hwnd_status: HWND::default(),
             hwnd_search: HWND::default(),
+            hwnd_split_tree: HWND::default(),
+            hwnd_split_pane: HWND::default(),
+            wf: WF_DEF,
+            wl: WL_DEF,
+            wr: WR_DEF,
+            tree_px: 0,
+            list_px: 0,
+            pane_px: 0,
+            dragging: false,
             controller: None,
             webview: None,
             font,
