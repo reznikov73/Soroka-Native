@@ -68,6 +68,8 @@ pub struct AppState {
     pub hwnd_compose: Option<HWND>,
     /// Открыто ли окно ящика.
     pub hwnd_account: Option<HWND>,
+    /// Открыто ли окно настроек (TASK-N09; одновременно — только одно).
+    pub hwnd_settings: Option<HWND>,
 
     // Дочерние окна и панель WebView2.
     pub hwnd_tree: HWND,
@@ -116,6 +118,7 @@ impl AppState {
             tree_slots: Vec::new(),
             hwnd_compose: None,
             hwnd_account: None,
+            hwnd_settings: None,
             hwnd_tree: HWND::default(),
             hwnd_list: HWND::default(),
             hwnd_status: HWND::default(),

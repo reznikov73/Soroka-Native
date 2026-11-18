@@ -1,9 +1,14 @@
-//! Сохранение компоновки (TASK-N04/N05/N06): веса панелей, тема и
-//! геометрия окон — один файл %APPDATA%\Soroka\layout.json.
+//! Сохранение компоновки (TASK-N04/N06): веса панелей и геометрия окон —
+//! один файл %APPDATA%\Soroka\layout.json.
 //! У Soroka то же самое лежит в localStorage «soroka.layout2» — файлы
 //! не конфликтуют (кэш и аккаунты общие, компоновка — своя у каждой
-//! оболочки). Срез N09 перенесёт тему в общий settings.json (порт ядра);
-//! веса и геометрия остаются здесь — это состояние оболочки.
+//! оболочки).
+//!
+//! Тема жила здесь с N05; в N09 переехала в общий settings.json
+//! (`native_theme`, порт ядра Soroka). Старое поле `theme` читается —
+//! для одноразовой миграции при старте (main.rs → settings::init_theme)
+//! — и больше не пишется: любая наша запись вычищает его из файла.
+//! Веса и геометрия остаются здесь — это состояние оболочки.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -55,8 +60,10 @@ impl Default for Weights {
 struct LayoutFile {
     #[serde(default)]
     weights: Weights,
-    /// «dark» (дефолт, как в Soroka) или «light» — TASK-N05.
-    #[serde(default)]
+    /// «dark»/«light» — до N09 (TASK-N05). Читается для одноразовой
+    /// миграции в settings.json; не сериализуется — любая запись файла
+    /// вычищает устаревший ключ.
+    #[serde(default, skip_serializing)]
     theme: Option<String>,
     /// Геометрия окон — TASK-N06 (в старых файлах нет — serde даст None).
     #[serde(default)]
@@ -73,7 +80,9 @@ pub struct Layout {
     pub wf: f64,
     pub wl: f64,
     pub wr: f64,
-    pub dark: bool,
+    /// Тема из старого файла (до N09) — только для одноразовой миграции
+    /// в settings.json; оболочка берёт тему из settings::init_theme.
+    pub theme: Option<String>,
     pub main: Option<WinPlacement>,
     pub compose: Option<WinPlacement>,
     pub account: Option<WinPlacement>,
@@ -92,11 +101,12 @@ pub fn load() -> Option<Layout> {
     load_from(file_path()?.as_path())
 }
 
-/// Сохранить веса и тему; геометрия окон в файле сохраняется
+/// Сохранить веса панелей; геометрия окон в файле сохраняется
 /// (read-modify-write: она пишется отдельно, при закрытии окон).
-pub fn save(wf: f64, wl: f64, wr: f64, dark: bool) {
+/// Темы здесь больше нет — с N09 она в settings.json (TASK-N09).
+pub fn save(wf: f64, wl: f64, wr: f64) {
     if let Some(p) = file_path() {
-        save_at(&p, wf, wl, wr, dark);
+        save_at(&p, wf, wl, wr);
     }
 }
 
@@ -108,14 +118,13 @@ pub fn store_window(kind: WinKind, wp: WinPlacement) {
     }
 }
 
-fn save_at(p: &Path, wf: f64, wl: f64, wr: f64, dark: bool) {
+fn save_at(p: &Path, wf: f64, wl: f64, wr: f64) {
     let mut f = read_or_default(p);
     f.weights = Weights {
         folders: wf,
         list: wl,
         reading: wr,
     };
-    f.theme = Some(if dark { "dark" } else { "light" }.to_string());
     write(p, &f);
 }
 
@@ -169,7 +178,7 @@ fn load_from(path: &Path) -> Option<Layout> {
         wf,
         wl,
         wr,
-        dark: f.theme.as_deref() != Some("light"),
+        theme: f.theme,
         main: f.main,
         compose: f.compose,
         account: f.account,
@@ -203,11 +212,10 @@ mod tests {
         let l = load_from(&p).unwrap();
         assert_eq!(l.main, Some(wp));
         assert!((l.wf - WF_DEF).abs() < 1e-9); // веса не заданы — дефолт
-        assert!(l.dark); // тема не задана — тёмная
-        save_at(&p, 0.5, 1.0, 2.0, false);
+        assert_eq!(l.theme, None); // темы в файле нет (N09: уехала в settings.json)
+        save_at(&p, 0.5, 1.0, 2.0);
         let l = load_from(&p).unwrap();
         assert!((l.wf - 0.5).abs() < 1e-9);
-        assert!(!l.dark);
         assert_eq!(l.main, Some(wp)); // save() не теряет геометрию
         let _ = std::fs::remove_file(&p);
     }
@@ -223,7 +231,7 @@ mod tests {
             maximized: false,
         };
         store_window_at(&p, WinKind::Compose, compose);
-        save_at(&p, 0.28, 1.24, 2.0, true);
+        save_at(&p, 0.28, 1.24, 2.0);
         let main = WinPlacement {
             x: 5,
             y: 6,
@@ -236,14 +244,35 @@ mod tests {
         assert_eq!(l.main, Some(main));
         assert_eq!(l.compose, Some(compose));
         assert_eq!(l.account, None);
-        assert!(l.dark); // тема пережила store_window
-        assert!((l.wf - 0.28).abs() < 1e-9); // и веса тоже
+        assert_eq!(l.theme, None); // темы больше нет в layout.json (N09)
+        assert!((l.wf - 0.28).abs() < 1e-9); // веса пережили store_window
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
-    fn file_without_theme_is_dark() {
-        // Файл формата v0.3.2 (только веса) — читается, тема дефолтно тёмная.
+    fn old_theme_is_read_for_migration_and_dropped_on_write() {
+        // Файл эпохи N05: тема ещё жила здесь. Читаем её (миграция в N09),
+        // но любая наша запись вычищает устаревший ключ.
+        let p = tmp("old-theme");
+        std::fs::write(
+            &p,
+            r#"{"weights":{"folders":0.28,"list":1.24,"reading":2.0},"theme":"light","main":{"x":1,"y":2,"w":3,"h":4}}"#,
+        )
+        .unwrap();
+        let l = load_from(&p).unwrap();
+        assert_eq!(l.theme.as_deref(), Some("light")); // для миграции
+        assert!((l.wf - 0.28).abs() < 1e-9);
+        save_at(&p, 0.5, 1.0, 2.0);
+        let l = load_from(&p).unwrap();
+        assert_eq!(l.theme, None); // вычищена записью
+        assert_eq!(l.main.map(|m| m.x), Some(1)); // геометрия пережила
+        assert!((l.wf - 0.5).abs() < 1e-9);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn file_without_theme_is_fine() {
+        // Файл формата v0.3.2/N09+ (только веса) — читается, темы нет.
         let p = tmp("old");
         std::fs::write(
             &p,
@@ -251,7 +280,7 @@ mod tests {
         )
         .unwrap();
         let l = load_from(&p).unwrap();
-        assert!(l.dark);
+        assert_eq!(l.theme, None);
         assert!((l.wf - 0.28).abs() < 1e-9);
         assert_eq!(l.main, None);
         let _ = std::fs::remove_file(&p);

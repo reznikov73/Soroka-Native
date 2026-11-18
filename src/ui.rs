@@ -75,6 +75,7 @@ pub const IDM_SEARCH_FOCUS: u16 = 130;
 pub const IDM_SEARCH_GO: u16 = 131;
 pub const IDM_SEARCH_CLOSE: u16 = 132;
 pub const IDM_THEME: u16 = 133;
+pub const IDM_SETTINGS: u16 = 134;
 
 /// EN_CHANGE — уведомление EDIT о вводе (приходит через WM_COMMAND).
 /// В windows-rs константа лежит в WindowsAndMessaging — локальный псевдоним надёжен.
@@ -196,7 +197,8 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
         );
 
         // TASK-N05: переключение темы. Галочка ставится/снимается при старте
-        // и переключении (CheckMenuItem в main.rs) — тема в layout.json.
+        // и переключении (CheckMenuItem в main.rs); с N09 тема хранится в
+        // общем settings.json (native_theme), за диалогом — TASK-N09.
         item(view, MF_STRING, IDM_THEME as usize, w!("Тёмная тема"));
 
         item(
@@ -206,6 +208,8 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
             w!("Добавить ящик..."),
         );
 
+        item(file, MF_STRING, IDM_SETTINGS as usize, w!("Настройки..."));
+        item(file, MF_SEPARATOR, 0, PCWSTR::null());
         item(file, MF_STRING, IDM_EXIT as usize, w!("Выход"));
 
         item(bar, MF_POPUP, mail.0 as usize, w!("&Почта"));
@@ -457,7 +461,7 @@ unsafe extern "system" fn splitter_proc(
                 // Финальная раскладка: панель письма получает новые bounds.
                 let _ =
                     unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
-                layout_store::save(st.wf, st.wl, st.wr, st.dark);
+                layout_store::save(st.wf, st.wl, st.wr);
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
             LRESULT(0)
@@ -476,7 +480,7 @@ unsafe extern "system" fn splitter_proc(
                 st.wl = WL_DEF;
             }
             let _ = unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
-            layout_store::save(st.wf, st.wl, st.wr, st.dark);
+            layout_store::save(st.wf, st.wl, st.wr);
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },

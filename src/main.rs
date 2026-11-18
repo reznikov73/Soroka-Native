@@ -20,6 +20,12 @@ mod backend;
 mod compose;
 mod dates;
 mod layout_store;
+// Настройки — дословный порт settings.rs Soroka (TASK-020/030/040/068...):
+// большая часть API (категории, промпты, подписи) понадобится в Фазе 3
+// (N13/N14), сейчас оболочка использует чтение и свои ключи — TASK-N09.
+#[allow(dead_code)]
+mod settings;
+mod settings_dlg;
 // Ядро Soroka перенесено дословно (правило WORKFLOW: src/mail/ не редактировать).
 // Часть его API (контакты, IDLE, пресеты провайдеров) подключается в Фазах 2–3 —
 // до тех пор dead_code на модуле неинформативен. Снять allow вместе с подключением
@@ -75,13 +81,14 @@ use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 use account_dlg::{WM_APP_ACCOUNT_CLOSED, WM_APP_ACCOUNT_SAVED};
 use backend::{Backend, BodyData, Job, WM_APP_MAIL, WM_APP_SEND_RESULT};
 use compose::{ComposePrefill, WM_APP_COMPOSE_CLOSED};
+use settings_dlg::{WM_APP_SETTINGS_CLOSED, WM_APP_SETTINGS_SAVED};
 use state::AppState;
 use ui::{
     EN_CHANGE, IDM_ACCOUNT_ADD, IDM_COMPOSE, IDM_DELETE, IDM_EXIT, IDM_FORWARD, IDM_REPLY,
-    IDM_REPLY_ALL, IDM_SEARCH_CLOSE, IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SYNC, IDM_THEME,
-    IDM_TOGGLE_SEEN, IDT_SEARCH, PANE_MIN, SEARCH_H, SPLIT_W, STATUS_CLASS, STATUS_H, SplitCtx,
-    apply_mail_event, apply_theme, create_fonts, create_menu, empty_pane_html, enter_search,
-    exit_search, fire_search, letter_html, on_get_disp_info, on_list_custom_draw,
+    IDM_REPLY_ALL, IDM_SEARCH_CLOSE, IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SETTINGS, IDM_SYNC,
+    IDM_THEME, IDM_TOGGLE_SEEN, IDT_SEARCH, PANE_MIN, SEARCH_H, SPLIT_W, STATUS_CLASS, STATUS_H,
+    SplitCtx, apply_mail_event, apply_theme, create_fonts, create_menu, empty_pane_html,
+    enter_search, exit_search, fire_search, letter_html, on_get_disp_info, on_list_custom_draw,
     on_list_item_changed, on_tree_select, rebuild_tree, register_splitter_class,
     register_status_class, restore_placement, setup_list_columns, snapshot_placement, status_text,
 };
@@ -91,7 +98,7 @@ const WINDOW_CLASS: PCWSTR = w!("SorokaNativeWnd");
 const EM_SETCUEBANNER: u32 = 0x1501;
 
 /// Клик по вложению в панели письма (WebView2 → оболочка): lparam = индекс.
-const WM_APP_ATTACH_CLICK: u32 = WM_APP_ACCOUNT_CLOSED + 1;
+const WM_APP_ATTACH_CLICK: u32 = WM_APP_SETTINGS_CLOSED + 1;
 
 /// Раскладка панелей (TASK-N04): дерево | сплиттер | список | сплиттер | тело.
 /// Ширины считаются из весов (аналог flex-grow в Soroka), минимум панели —
@@ -417,6 +424,52 @@ unsafe extern "system" fn search_edit_proc(
     unsafe { CallWindowProcW(proc, hwnd, msg, wparam, lparam) }
 }
 
+/// Применить тему (TASK-N05; с N09 хранится в settings.json — native_theme).
+/// Оболочка красится применением палитры, панель письма — пере-навигацией
+/// (данные письма уже в pane_body — бэкенд не трогаем). Вызывается при
+/// переключении «Вид → Тёмная тема» и из диалога настроек.
+unsafe fn set_theme(hwnd: HWND, st: &mut AppState, dark: bool) {
+    st.dark = dark;
+    let menu = unsafe { GetMenu(hwnd) };
+    if !menu.is_invalid() {
+        unsafe {
+            let _ = CheckMenuItem(
+                menu,
+                IDM_THEME as u32,
+                MF_BYCOMMAND.0
+                    | if st.dark {
+                        MF_CHECKED.0
+                    } else {
+                        MF_UNCHECKED.0
+                    },
+            );
+        }
+    }
+    apply_theme(st);
+    let html = if let Some(b) = st.pane_body.as_ref()
+        && let Some(row) = st.rows.iter().find(|r| r.hdr.uid == b.uid)
+    {
+        letter_html(
+            &row.hdr,
+            &BodyData {
+                text: b.text.clone(),
+                html: b.html.clone(),
+                attachments: b.attachments.clone(),
+                truncated: b.truncated,
+            },
+            st.dark,
+        )
+    } else {
+        empty_pane_html(st.dark)
+    };
+    if let Some(wv) = &st.webview {
+        let _ = unsafe { wv.NavigateToString(&HSTRING::from(html)) };
+    }
+    // Тема — в общем settings.json (TASK-N09): только свой ключ,
+    // остальное содержимое файла не трогаем.
+    settings::store_theme(dark);
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_NCCREATE => {
@@ -464,46 +517,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     unsafe { layout(hwnd, st) };
                 }
                 IDM_THEME => {
-                    // TASK-N05: переключение темы. Оболочка красится
-                    // применением палитры, панель письма — пере-навигацией
-                    // (данные письма уже в pane_body — бэкенд не трогаем).
-                    st.dark = !st.dark;
-                    let menu = unsafe { GetMenu(hwnd) };
-                    if !menu.is_invalid() {
-                        unsafe {
-                            let _ = CheckMenuItem(
-                                menu,
-                                IDM_THEME as u32,
-                                MF_BYCOMMAND.0
-                                    | if st.dark {
-                                        MF_CHECKED.0
-                                    } else {
-                                        MF_UNCHECKED.0
-                                    },
-                            );
-                        }
-                    }
-                    apply_theme(st);
-                    let html = if let Some(b) = st.pane_body.as_ref()
-                        && let Some(row) = st.rows.iter().find(|r| r.hdr.uid == b.uid)
-                    {
-                        letter_html(
-                            &row.hdr,
-                            &BodyData {
-                                text: b.text.clone(),
-                                html: b.html.clone(),
-                                attachments: b.attachments.clone(),
-                                truncated: b.truncated,
-                            },
-                            st.dark,
-                        )
-                    } else {
-                        empty_pane_html(st.dark)
-                    };
-                    if let Some(wv) = &st.webview {
-                        let _ = unsafe { wv.NavigateToString(&HSTRING::from(html)) };
-                    }
-                    layout_store::save(st.wf, st.wl, st.wr, st.dark);
+                    // TASK-N05: быстрое переключение темы меню «Вид».
+                    unsafe { set_theme(hwnd, st, !st.dark) };
                     status_text(
                         st,
                         if st.dark {
@@ -512,6 +527,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             "тема: светлая"
                         },
                     );
+                }
+                IDM_SETTINGS => {
+                    // TASK-N09: диалог настроек (settings.json общий с Soroka).
+                    if let Some(h) = settings_dlg::open(hwnd, st) {
+                        st.hwnd_settings = Some(h);
+                    }
                 }
                 IDM_EXIT => {
                     let _ = unsafe { DestroyWindow(hwnd) };
@@ -676,6 +697,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             rebuild_tree(st.hwnd_tree, st);
             LRESULT(0)
         }
+        WM_APP_SETTINGS_SAVED => {
+            // Диалог настроек сохранил файл (TASK-N09): перечитываем свои
+            // ключи; тема могла измениться — применяем как «Вид → Тёмная тема».
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            let view = settings::native_view();
+            if view.dark != st.dark {
+                unsafe { set_theme(hwnd, st, view.dark) };
+            }
+            status_text(st, "настройки сохранены (settings.json общий с Soroka)");
+            LRESULT(0)
+        }
+        WM_APP_SETTINGS_CLOSED => {
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            st.hwnd_settings = None;
+            LRESULT(0)
+        }
         WM_APP_ACCOUNT_CLOSED => {
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             st.hwnd_account = None;
@@ -777,18 +814,24 @@ fn run() -> Result<()> {
 
     // Состояние уходит в GWLP_USERDATA через CREATESTRUCTW (WM_NCCREATE).
     let state = Box::into_raw(Box::new(AppState::new(font, font_bold)));
-    // Компоновка из %APPDATA%\Soroka\layout.json (TASK-N04/N05/N06):
-    // веса, тема, геометрия главного окна; нет файла — дефолт Soroka
-    // (веса LAYOUT_DEFAULTS, тёмная тема, системная позиция окна).
+    // Компоновка из %APPDATA%\Soroka\layout.json (TASK-N04/N06): веса и
+    // геометрия главного окна; нет файла — дефолт Soroka (веса
+    // LAYOUT_DEFAULTS, системная позиция окна).
     let mut main_placement = None;
-    if let Some(l) = layout_store::load() {
+    let layout_cfg = layout_store::load();
+    if let Some(l) = &layout_cfg {
         unsafe {
             (*state).wf = l.wf;
             (*state).wl = l.wl;
             (*state).wr = l.wr;
-            (*state).dark = l.dark;
         }
         main_placement = l.main;
+    }
+    // Тема — в общем settings.json (native_theme, TASK-N09). Из layout.json
+    // (там её хранил N05) переносится одноразово; нет нигде — тёмная,
+    // как в Soroka.
+    unsafe {
+        (*state).dark = settings::init_theme(layout_cfg.as_ref().and_then(|l| l.theme.as_deref()));
     }
     let hwnd = unsafe {
         CreateWindowExW(
