@@ -20,6 +20,9 @@ mod autostart;
 mod backend;
 mod compose;
 mod dates;
+// Черновики (TASK-N08): чистая логика (id, отпечаток изменений, заголовок
+// X-Soroka-Draft, копия/вложения в записи drafts) — тестируется на Linux.
+mod draft;
 mod ico;
 mod layout_store;
 // Настройки — дословный порт settings.rs Soroka (TASK-020/030/040/068...):
@@ -90,7 +93,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
 use account_dlg::{WM_APP_ACCOUNT_CLOSED, WM_APP_ACCOUNT_SAVED};
-use backend::{Backend, BodyData, Job, MailEvent, WM_APP_MAIL, WM_APP_SEND_RESULT};
+use backend::{
+    Backend, BodyData, DraftSaved, Job, MailEvent, WM_APP_DRAFT_SAVED, WM_APP_MAIL,
+    WM_APP_SEND_RESULT,
+};
 use compose::{ComposePrefill, WM_APP_COMPOSE_CLOSED};
 use mail::store::Store;
 use settings_dlg::{WM_APP_SETTINGS_CLOSED, WM_APP_SETTINGS_SAVED};
@@ -346,6 +352,8 @@ fn reply_prefill(st: &AppState, all: bool) -> Option<ComposePrefill> {
         cc,
         subject,
         body: quote_body(hdr, st.pane_body.as_ref()),
+        atts: Vec::new(),
+        draft_id: None,
     })
 }
 
@@ -364,6 +372,8 @@ fn forward_prefill(st: &AppState) -> Option<ComposePrefill> {
         cc: String::new(),
         subject,
         body: quote_body(hdr, st.pane_body.as_ref()),
+        atts: Vec::new(),
+        draft_id: None,
     })
 }
 
@@ -374,6 +384,53 @@ fn selected_header(st: &AppState) -> Option<mail::imap::MessageHeader> {
         .iter()
         .find(|m| m.hdr.uid == uid)
         .map(|r| r.hdr.clone())
+}
+
+/// Ящик, чья папка черновиков — этот ключ (по кэшу папок, как find_drafts
+/// при сохранении черновика TASK-N08). None — ключ не папка черновиков.
+fn drafts_account_of(key: &str) -> Option<String> {
+    let acc = mail::accounts::split_key(key).0?;
+    let found = Store::open_default()
+        .ok()
+        .and_then(|s| s.load_folders(&format!("{acc}::%")).ok())
+        .and_then(|fs| mail::imap::find_drafts(&fs))?;
+    (found == key).then_some(acc)
+}
+
+/// Двойной клик по строке списка (TASK-N08): в папке черновиков — продолжить
+/// редактирование в окне написания (порт TASK-022; получатели/копия/вложения
+/// берутся из локальной записи — серверная копия их не хранит).
+fn open_draft_if_any(hwnd: HWND, st: &mut AppState, i: usize) {
+    let Some(uid) = st.rows.get(i).map(|r| r.hdr.uid) else {
+        return;
+    };
+    let Some(key) = st.current_folder.clone() else {
+        return;
+    };
+    let Some(acc) = drafts_account_of(&key) else {
+        return;
+    };
+    let Some(rec) = Store::open_default()
+        .ok()
+        .and_then(|s| s.draft_by_uid(&acc, uid).ok().flatten())
+    else {
+        return;
+    };
+    let (cc, atts) = draft::decode_extra(rec.attachments.as_deref());
+    let p = ComposePrefill {
+        to: rec.to_addr,
+        cc,
+        subject: rec.subject,
+        body: rec.body,
+        atts: atts
+            .into_iter()
+            .map(|(name, mime, data)| mail::smtp::OutgoingAttachment { name, mime, data })
+            .collect(),
+        draft_id: Some(rec.id),
+    };
+    if let Some(h) = compose::open(hwnd, st, Some(p)) {
+        st.hwnd_compose = Some(h);
+    }
 }
 
 /// Сабкласс поля поиска (TASK-N03): Enter — искать, Esc — вернуться к папке.
@@ -796,6 +853,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         on_list_item_changed(st, nm);
                         return LRESULT(0);
                     }
+                    windows::Win32::UI::Controls::LVN_ITEMACTIVATE => {
+                        // Двойной клик по строке (TASK-N08): черновик —
+                        // продолжить редактирование в окне написания.
+                        let nm = unsafe {
+                            &*(lparam.0 as *const windows::Win32::UI::Controls::NMITEMACTIVATE)
+                        };
+                        open_draft_if_any(hwnd, st, nm.iItem.max(0) as usize);
+                        return LRESULT(0);
+                    }
                     _ => {}
                 }
             } else if hdr.hwndFrom == st.hwnd_tree && hdr.code == TVN_SELCHANGEDW {
@@ -876,6 +942,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_COMPOSE_CLOSED => {
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             st.hwnd_compose = None;
+            // Черновик мог появиться/измениться (TASK-N08): если смотрим его
+            // папку — обновляем список (как mail-changed в Soroka после
+            // закрытия редактора).
+            if let Some(key) = st.current_folder.clone()
+                && drafts_account_of(&key).is_some()
+                && let Some(b) = &st.backend
+            {
+                b.post(Job::SyncFolder { key });
+            }
             LRESULT(0)
         }
         WM_APP_ACCOUNT_SAVED => {
@@ -915,6 +990,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_SEND_RESULT => {
             // Приходит только окну редактора; сюда не должен попадать.
+            LRESULT(0)
+        }
+        WM_APP_DRAFT_SAVED => {
+            // Ответ сохранения идёт окну редактора (TASK-N08); сюда не
+            // должен попадать — но Box освободим, чтобы не течь.
+            drop(unsafe { Box::from_raw(lparam.0 as *mut DraftSaved) });
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == IDT_SEARCH => {

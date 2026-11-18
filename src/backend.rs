@@ -14,13 +14,14 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::mail::accounts::{self, Account};
 use crate::mail::body::{self, AttachmentMeta};
 use crate::mail::imap::{self, FETCH_LIMIT};
 use crate::mail::smtp::{self, OutgoingAttachment};
-use crate::mail::store::{SearchHit, Store};
+use crate::mail::store::{DraftRecord, SearchHit, Store};
 
 /// Лимит выдачи поиска — как у команды Soroka (TASK-033/082).
 const SEARCH_LIMIT: usize = 200;
@@ -31,6 +32,9 @@ pub const WM_APP_MAIL: u32 = WM_APP;
 pub const WM_APP_SEND_RESULT: u32 = WM_APP + 1;
 /// Ответ окна ящика (тест соединения): lParam = *mut LoginOutcome.
 pub const WM_APP_LOGIN_RESULT: u32 = WM_APP + 2;
+/// Ответ на сохранение черновика (TASK-N08): lParam = *mut DraftSaved.
+/// Цепочка WM_APP живёт в разных модулях — продолжаем за треем (TASK-N07).
+pub const WM_APP_DRAFT_SAVED: u32 = crate::tray::WM_APP_TRAY + 1;
 
 /// Задача для рабочего потока.
 pub enum Job {
@@ -43,6 +47,7 @@ pub enum Job {
     /// Удалить письмо (в корзину сервера, TASK-092-логика из Soroka).
     DeleteMessage { key: String, uid: u32 },
     /// Отправить письмо (порт send_mail + очередь TASK-089 + копия в Отправленные).
+    /// draft_id — сохранить и убрать черновик после отправки (TASK-N08).
     SendMail {
         hwnd_reply: HWND,
         account_id: String,
@@ -51,6 +56,22 @@ pub enum Job {
         subject: String,
         body: String,
         atts: Vec<OutgoingAttachment>,
+        draft_id: Option<String>,
+    },
+    /// Сохранить черновик (порт save_draft, TASK-022/N08): локальная копия
+    /// в drafts и IMAP APPEND в папку \Drafts. print — отпечаток полей на
+    /// момент постановки задачи (окно редактора по нему поймёт, что уже
+    /// сохранено).
+    SaveDraft {
+        hwnd_reply: HWND,
+        account_id: String,
+        draft_id: String,
+        to: String,
+        cc: String,
+        subject: String,
+        body: String,
+        atts: Vec<OutgoingAttachment>,
+        print: String,
     },
     /// Сохранить вложение письма в «Загрузки» (порт save_attachment).
     SaveAttachment { key: String, uid: u32, index: u32 },
@@ -93,7 +114,11 @@ pub enum MailEvent {
         body: BodyData,
     },
     /// Тело не удалось получить.
-    BodyFailed { key: String, uid: u32, error: String },
+    BodyFailed {
+        key: String,
+        uid: u32,
+        error: String,
+    },
     /// Письмо помечено прочитанным (сервер + кэш).
     Seen { key: String, uid: u32 },
     /// Письмо помечено непрочитанным.
@@ -133,6 +158,25 @@ pub struct SendOutcome {
 pub struct LoginOutcome {
     pub ok: bool,
     pub msg: String,
+}
+
+/// Результат сохранения черновика (WM_APP_DRAFT_SAVED, TASK-N08):
+/// окно редактора показывает label, по print помечает состояние
+/// сохранённым (окно закрывается, если ждало ответа).
+pub struct DraftSaved {
+    pub ok: bool,
+    /// Отпечаток сохранённого содержимого (эхо из задачи).
+    pub print: String,
+    /// «✓ сохранено ЧЧ:ММ» / «✓ сохранено локально ЧЧ:ММ».
+    pub label: String,
+    /// Заметка (причина локального сохранения / текст ошибки).
+    pub msg: String,
+}
+
+/// Локальное время ЧЧ:ММ для подписи «сохранено» (порт composeSaved).
+fn local_hhmm() -> (u32, u32) {
+    let t = unsafe { GetLocalTime() };
+    (t.wHour as u32, t.wMinute as u32)
 }
 
 /// Общая шина: задачи в рабочий поток, события обратно.
@@ -205,7 +249,38 @@ fn handle(job: Job) -> Vec<MailEvent> {
             subject,
             body,
             atts,
-        } => send_mail(hwnd_reply, &account_id, &to, &cc, &subject, &body, &atts),
+            draft_id,
+        } => send_mail(
+            hwnd_reply,
+            &account_id,
+            &to,
+            &cc,
+            &subject,
+            &body,
+            &atts,
+            draft_id.as_deref(),
+        ),
+        Job::SaveDraft {
+            hwnd_reply,
+            account_id,
+            draft_id,
+            to,
+            cc,
+            subject,
+            body,
+            atts,
+            print,
+        } => save_draft(
+            hwnd_reply,
+            &account_id,
+            &draft_id,
+            &to,
+            &cc,
+            &subject,
+            &body,
+            &atts,
+            &print,
+        ),
         Job::SaveAttachment { key, uid, index } => save_attachment(&key, uid, index),
         Job::TestLogin {
             hwnd_reply,
@@ -215,10 +290,7 @@ fn handle(job: Job) -> Vec<MailEvent> {
             password,
         } => {
             let outcome = match imap::test_login(&host, port, &user, &password) {
-                Ok(msg) => LoginOutcome {
-                    ok: true,
-                    msg,
-                },
+                Ok(msg) => LoginOutcome { ok: true, msg },
                 Err(e) => LoginOutcome {
                     ok: false,
                     msg: e.to_string(),
@@ -262,7 +334,7 @@ fn sync_folder(key: &str) -> Vec<MailEvent> {
                 fetched: 0,
                 error: Some(e.to_string()),
                 folders_refreshed: false,
-            }]
+            }];
         }
     };
     let is_inbox = name == "INBOX";
@@ -281,16 +353,14 @@ fn sync_folder(key: &str) -> Vec<MailEvent> {
                 fetched: 0,
                 error: Some(e.to_string()),
                 folders_refreshed: false,
-            }]
+            }];
         }
     };
     let fetched = headers.len() as u32;
 
     let mut store = match Store::open_default() {
         Ok(s) => s,
-        Err(e) => {
-            return vec![MailEvent::Status(format!("кэш не открылся: {e}"))]
-        }
+        Err(e) => return vec![MailEvent::Status(format!("кэш не открылся: {e}"))],
     };
     // TASK-032/038: пустой ответ сервера не стирает кэш.
     let cached = store
@@ -354,7 +424,7 @@ fn fetch_body(key: &str, uid: u32) -> Vec<MailEvent> {
                 key: key.to_string(),
                 uid,
                 error: e.to_string(),
-            }]
+            }];
         }
     };
     if let Ok(Some(c)) = store.load_body(key, uid) {
@@ -377,7 +447,7 @@ fn fetch_body(key: &str, uid: u32) -> Vec<MailEvent> {
                 key: key.to_string(),
                 uid,
                 error: e.to_string(),
-            }]
+            }];
         }
     };
     match body::fetch_body(&acc.config(), &name, uid) {
@@ -455,15 +525,25 @@ fn delete_message(key: &str, uid: u32) -> Vec<MailEvent> {
 fn save_attachment(key: &str, uid: u32, index: u32) -> Vec<MailEvent> {
     let (acc, name) = match accounts::resolve_cfg(key) {
         Ok(v) => v,
-        Err(e) => return vec![MailEvent::AttachFailed { error: e.to_string() }],
+        Err(e) => {
+            return vec![MailEvent::AttachFailed {
+                error: e.to_string(),
+            }];
+        }
     };
     let raw = match body::fetch_raw(&acc.config(), &name, uid) {
         Ok(v) => v,
-        Err(e) => return vec![MailEvent::AttachFailed { error: e.to_string() }],
+        Err(e) => {
+            return vec![MailEvent::AttachFailed {
+                error: e.to_string(),
+            }];
+        }
     };
     match body::save_attachment_to_downloads(&raw, index) {
         Ok(path) => vec![MailEvent::AttachSaved { path }],
-        Err(e) => vec![MailEvent::AttachFailed { error: e.to_string() }],
+        Err(e) => vec![MailEvent::AttachFailed {
+            error: e.to_string(),
+        }],
     }
 }
 
@@ -489,7 +569,8 @@ struct QueuedFile {
 /// Отличаем «сети нет» от отказа сервера (порт looks_like_offline).
 fn looks_like_offline(msg: &str) -> bool {
     let s = msg.to_lowercase();
-    if s.contains("authentication") || s.contains("535") || s.contains("неверный пароль") {
+    if s.contains("authentication") || s.contains("535") || s.contains("неверный пароль")
+    {
         return false;
     }
     [
@@ -510,6 +591,7 @@ fn looks_like_offline(msg: &str) -> bool {
 }
 
 /// Порт send_mail: сборка → отправка → копия в «Отправленные» / очередь.
+#[allow(clippy::too_many_arguments)]
 fn send_mail(
     hwnd_reply: HWND,
     account_id: &str,
@@ -518,6 +600,7 @@ fn send_mail(
     subject: &str,
     body: &str,
     atts: &[OutgoingAttachment],
+    draft_id: Option<&str>,
 ) -> Vec<MailEvent> {
     let finish = |outcome: SendOutcome| -> Vec<MailEvent> {
         post_boxed(hwnd_reply, WM_APP_SEND_RESULT, outcome);
@@ -532,7 +615,7 @@ fn send_mail(
                     ok: false,
                     queued: false,
                     msg: "ящик не настроен".into(),
-                })
+                });
             }
         },
     };
@@ -545,14 +628,9 @@ fn send_mail(
     }
     let cfg = account.config();
     let message = match smtp::build_message_full(
-        &cfg,
-        to,
-        cc,
+        &cfg, to, cc,
         "", // bcc: в нативном редакторе Фазы 1 не вводится
-        subject,
-        body,
-        None,
-        atts,
+        subject, body, None, atts,
     ) {
         Ok(m) => m,
         Err(e) => {
@@ -560,16 +638,24 @@ fn send_mail(
                 ok: false,
                 queued: false,
                 msg: e.to_string(),
-            })
+            });
         }
     };
     let raw = message.formatted();
     match smtp::send_message(&cfg, to, cc, "", subject, body, None, atts) {
         Ok(()) => {
             let report = save_sent_copy(&cfg, &raw);
+            // Черновик отправлен — больше не нужен (порт delete_draft,
+            // TASK-022): убираем с сервера и из кэша.
+            if let Some(id) = draft_id {
+                cleanup_draft(&account, id);
+            }
             let mut msg = String::from("письмо отправлено");
             if report.copied {
-                msg.push_str(&format!("; копия в «{}»", report.sent_folder.unwrap_or_default()));
+                msg.push_str(&format!(
+                    "; копия в «{}»",
+                    report.sent_folder.unwrap_or_default()
+                ));
             } else if let Some(err) = report.copy_error {
                 msg.push_str(&format!("; копия в «Отправленные» не сохранилась: {err}"));
             }
@@ -596,8 +682,7 @@ fn send_mail(
                         .map(|a| QueuedFile {
                             name: a.name.clone(),
                             mime: a.mime.clone(),
-                            data_b64: base64::engine::general_purpose::STANDARD
-                                .encode(&a.data),
+                            data_b64: base64::engine::general_purpose::STANDARD.encode(&a.data),
                         })
                         .collect(),
                 };
@@ -608,17 +693,24 @@ fn send_mail(
                             ok: false,
                             queued: false,
                             msg: format!("очередь не собралась: {e}"),
-                        })
+                        });
                     }
                 };
                 match Store::open_default()
                     .and_then(|s| s.queue_outbox(&account.id, to, subject, &payload))
                 {
-                    Ok(_) => finish(SendOutcome {
-                        ok: true,
-                        queued: true,
-                        msg: "сети нет — письмо поставлено в очередь (уйдёт при следующей синхронизации)".into(),
-                    }),
+                    Ok(_) => {
+                        // Ушло в очередь — текст уже не потеряется; черновик
+                        // убираем и тут (как Сорока: ok = отправлено/в очереди).
+                        if let Some(id) = draft_id {
+                            cleanup_draft(&account, id);
+                        }
+                        finish(SendOutcome {
+                            ok: true,
+                            queued: true,
+                            msg: "сети нет — письмо поставлено в очередь (уйдёт при следующей синхронизации)".into(),
+                        })
+                    }
                     Err(e) => finish(SendOutcome {
                         ok: false,
                         queued: false,
@@ -634,6 +726,152 @@ fn send_mail(
             }
         }
     }
+}
+
+/// Порт save_draft (TASK-022): локальная копия в drafts + IMAP APPEND
+/// в папку \Drafts, старая серверная копия убирается. Отличия от Сороки
+/// (сознательные, см. TASK-N08): при недоступности сервера/папки черновик
+/// сохраняется локально (uid=None) — текст не теряется, серверная копия
+/// появится при первом успешном сохранении; недописанный адрес не мешает
+/// сохранить черновик (получатели живут в локальной записи).
+#[allow(clippy::too_many_arguments)]
+fn save_draft(
+    hwnd_reply: HWND,
+    account_id: &str,
+    draft_id: &str,
+    to: &str,
+    cc: &str,
+    subject: &str,
+    body: &str,
+    atts: &[OutgoingAttachment],
+    print: &str,
+) -> Vec<MailEvent> {
+    let finish = |ok: bool, local: bool, msg: &str| -> Vec<MailEvent> {
+        let (hh, mm) = local_hhmm();
+        let label = if local {
+            format!("✓ сохранено локально {hh:02}:{mm:02}")
+        } else {
+            crate::draft::saved_label(hh, mm)
+        };
+        post_boxed(
+            hwnd_reply,
+            WM_APP_DRAFT_SAVED,
+            DraftSaved {
+                ok,
+                print: print.to_string(),
+                label,
+                msg: msg.to_string(),
+            },
+        );
+        Vec::new()
+    };
+    let account: Account = match accounts::account_by_id(account_id) {
+        Some(a) => a,
+        None => match accounts::first_account() {
+            Some(a) => a,
+            None => return finish(false, false, "ящик не настроен"),
+        },
+    };
+    let cfg = account.config();
+    // Как в Soroka: письмо без To: не строится — пустое «Кому» собирается
+    // адресом самого ящика (в локальной записи остаётся пустым).
+    let to_for_build = if to.trim().is_empty() {
+        cfg.user.clone()
+    } else {
+        to.trim().to_string()
+    };
+    let build = |to_b: &str, cc_b: &str| -> Result<Vec<u8>, String> {
+        smtp::build_message_full(&cfg, to_b, cc_b, "", subject, body, None, atts)
+            .map(|m| crate::draft::insert_draft_header(&m.formatted(), draft_id))
+            .map_err(|e| e.to_string())
+    };
+    let raw = match build(&to_for_build, cc) {
+        Ok(r) => r,
+        // Адрес ещё недописан — черновик не должен из-за этого теряться:
+        // серверная копия собирается без получателей (они в локальной записи).
+        Err(_) => match build(&cfg.user, "") {
+            Ok(r) => r,
+            Err(e) => return finish(false, false, &e),
+        },
+    };
+    let Ok(mut store) = Store::open_default() else {
+        return finish(false, false, "кэш не открылся");
+    };
+    let prev = store
+        .load_drafts(&account.id)
+        .ok()
+        .and_then(|list| list.into_iter().find(|d| d.id == draft_id));
+    // Папка черновиков: из кэша, иначе LIST (как в Soroka; в кэше имена
+    // с префиксом ящика — на сервер уходит только имя).
+    let folder: Option<String> = store
+        .load_folders(&format!("{}::%", account.id))
+        .ok()
+        .and_then(|fs| imap::find_drafts(&fs))
+        .or_else(|| {
+            imap::list_folders(&cfg)
+                .ok()
+                .and_then(|fs| imap::find_drafts(&fs))
+        })
+        .map(|k| accounts::split_key(&k).1);
+    let (uid, server_note): (Option<u32>, Option<String>) = match &folder {
+        Some(f) => match imap::append_draft(&cfg, f, &raw, draft_id) {
+            Ok(u) => (u, None),
+            Err(e) => (None, Some(e.to_string())),
+        },
+        None => (None, Some("папка черновиков не найдена".into())),
+    };
+    // Старая серверная копия не нужна, когда есть новая (APPEND всегда
+    // создаёт сообщение заново). Без новой копии старую не трогаем.
+    if let (Some(f), Some(old)) = (&folder, prev.as_ref().and_then(|p| p.uid))
+        && Some(old) != uid
+    {
+        let _ = imap::delete_permanently(&cfg, f, old);
+    }
+    let att_triples: Vec<(String, String, Vec<u8>)> = atts
+        .iter()
+        .map(|a| (a.name.clone(), a.mime.clone(), a.data.clone()))
+        .collect();
+    let rec = DraftRecord {
+        account: account.id.clone(),
+        id: draft_id.to_string(),
+        folder: folder.clone().unwrap_or_default(),
+        uid,
+        to_addr: to.to_string(),
+        subject: subject.to_string(),
+        body: body.to_string(),
+        attachments: crate::draft::encode_extra(cc, &att_triples),
+        updated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    };
+    if let Err(e) = store.save_draft(&rec) {
+        return finish(false, false, &e.to_string());
+    }
+    match server_note {
+        Some(note) => finish(true, true, &note),
+        None => finish(true, false, ""),
+    }
+}
+
+/// После отправки черновик не нужен (порт delete_draft, TASK-022):
+/// серверная копия (\Deleted + EXPUNGE) и запись в кэше.
+fn cleanup_draft(account: &Account, draft_id: &str) {
+    let Ok(mut store) = Store::open_default() else {
+        return;
+    };
+    let Ok(list) = store.load_drafts(&account.id) else {
+        return;
+    };
+    let Some(rec) = list.into_iter().find(|d| d.id == draft_id) else {
+        return;
+    };
+    if let Some(uid) = rec.uid {
+        let cfg = account.config();
+        let (_, folder) = accounts::split_key(&rec.folder);
+        let _ = imap::delete_permanently(&cfg, &folder, uid);
+    }
+    let _ = store.drop_draft(&account.id, draft_id);
 }
 
 /// Итог копии в «Отправленные» (порт SendReport).
@@ -659,7 +897,7 @@ fn save_sent_copy(cfg: &imap::AccountConfig, raw: &[u8]) -> SentReport {
                 copied: false,
                 sent_folder: None,
                 copy_error: Some(format!("не удалось получить список папок: {err}")),
-            }
+            };
         }
     };
     let Some(name) = imap::find_sent(&folders) else {

@@ -17,14 +17,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL,
     ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW,
-    IDC_ARROW, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LBS_NOTIFY, LoadCursorW, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_OK, MessageBoxW, RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    IDC_ARROW, KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LBS_NOTIFY, LoadCursorW,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_YESNO, MessageBoxW, RegisterClassW, SetTimer,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
+    WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
-use crate::backend::{Job, SendOutcome, WM_APP_SEND_RESULT};
+use crate::backend::{DraftSaved, Job, SendOutcome, WM_APP_DRAFT_SAVED, WM_APP_SEND_RESULT};
 use crate::mail::smtp::OutgoingAttachment;
 use crate::state::AppState;
 use crate::wide::{read_text, set_window_text, wide};
@@ -45,13 +46,22 @@ const IDC_BTN_REMOVE: i32 = 206;
 const IDC_BTN_SEND: i32 = 207;
 const IDC_BTN_CANCEL: i32 = 208;
 const IDC_STATUS: i32 = 209;
+const IDC_BTN_DRAFT: i32 = 210;
 
-/// Предзаполнение редактора (ответ/пересылка).
+/// Автосохранение черновика (порт startDraftAutosave: 20 с, TASK-022).
+const IDT_DRAFT_AUTOSAVE: usize = 3;
+
+/// Предзаполнение редактора (ответ/пересылка/черновик — TASK-N08).
 pub struct ComposePrefill {
     pub to: String,
     pub cc: String,
     pub subject: String,
     pub body: String,
+    /// Вложения редактируемого черновика (продолжение с того же места).
+    pub atts: Vec<OutgoingAttachment>,
+    /// Идентификатор существующего черновика: пересохраняем ту же запись,
+    /// отправка уберет её с сервера. None — новое письмо/ответ/пересылка.
+    pub draft_id: Option<String>,
 }
 
 /// Состояние окна редактора (GWLP_USERDATA).
@@ -67,8 +77,19 @@ struct ComposeState {
     hwnd_attach_list: HWND,
     hwnd_btn_send: HWND,
     hwnd_btn_cancel: HWND,
+    hwnd_btn_draft: HWND,
     hwnd_status: HWND,
     sending: bool,
+    /// Идентификатор черновика этого окна (TASK-N08): одна запись на всё
+    /// время редактирования, пересохранения заменяют серверную копию.
+    draft_id: String,
+    /// Черновик уже сохранён (кнопкой/автосохранением/он был открыт).
+    draft_saved: bool,
+    /// Отпечаток последнего сохранённого содержимого (не изменилось —
+    /// не пересохраняем: каждое сохранение это IMAP APPEND + удаление).
+    last_print: String,
+    /// Окно закрывается и ждёт результата сохранения черновика.
+    closing_saving: bool,
 }
 
 /// Открывает редактор (один на приложение). Возвращает HWND нового окна.
@@ -86,6 +107,16 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
         .clone()
         .or_else(|| st.accounts.first().map(|a| a.id.clone()))
         .unwrap_or_default();
+    // Черновик: открыт существующий — продолжаем ту же запись; новое
+    // письмо — свежий идентификатор (порт newDraftId, TASK-N08).
+    let draft_id = prefill
+        .as_ref()
+        .and_then(|p| p.draft_id.clone())
+        .unwrap_or_else(crate::draft::new_draft_id);
+    let settled = prefill
+        .as_ref()
+        .and_then(|p| p.draft_id.as_deref())
+        .is_some();
 
     let hmod = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
     let wc = WNDCLASSW {
@@ -109,8 +140,13 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
         hwnd_attach_list: HWND::default(),
         hwnd_btn_send: HWND::default(),
         hwnd_btn_cancel: HWND::default(),
+        hwnd_btn_draft: HWND::default(),
         hwnd_status: HWND::default(),
         sending: false,
+        draft_id,
+        draft_saved: settled,
+        last_print: String::new(),
+        closing_saving: false,
     });
     let raw = Box::into_raw(state);
 
@@ -139,6 +175,18 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
             let _ = set_text(st.hwnd_cc, &p.cc);
             let _ = set_text(st.hwnd_subject, &p.subject);
             let _ = set_text(st.hwnd_body, &p.body);
+            st.atts = p.atts;
+            // Открыт существующий черновик: содержимое уже сохранено —
+            // автосохранение не должно пересохранять его тут же.
+            if settled {
+                let att_meta: Vec<(&str, u64)> = st
+                    .atts
+                    .iter()
+                    .map(|a| (a.name.as_str(), a.data.len() as u64))
+                    .collect();
+                st.last_print =
+                    crate::draft::fingerprint(&p.to, &p.cc, &p.subject, &p.body, &att_meta);
+            }
         }
     }
 
@@ -274,7 +322,8 @@ unsafe fn layout(hwnd: HWND, st: &ComposeState) {
         );
         move_window(st.hwnd_btn_send, w - m - 130, h - 38, 130, 30);
         move_window(st.hwnd_btn_cancel, w - m - 250, h - 38, 110, 30);
-        move_window(st.hwnd_status, m, h - 30, (w - 2 * m - 270).max(120), 24);
+        move_window(st.hwnd_btn_draft, w - m - 370, h - 38, 110, 30);
+        move_window(st.hwnd_status, m, h - 30, (w - 2 * m - 390).max(120), 24);
     }
 }
 
@@ -359,6 +408,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 set_font(b_attach, hfont);
                 set_font(b_remove, hfont);
+                // «В черновики» (TASK-N08): сохранить не отправляя.
+                let b_draft = child(
+                    hwnd,
+                    w!("BUTTON"),
+                    Some("В черновики"),
+                    WS_TABSTOP.0,
+                    12,
+                    214,
+                    130,
+                    28,
+                    IDC_BTN_DRAFT,
+                );
+                set_font(b_draft, hfont);
                 // Тело письма.
                 st.hwnd_body = child(
                     hwnd,
@@ -391,7 +453,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 st.hwnd_btn_cancel = child(
                     hwnd,
                     w!("BUTTON"),
-                    Some("Отмена"),
+                    Some("Закрыть"),
                     WS_TABSTOP.0,
                     150,
                     12,
@@ -401,6 +463,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 set_font(st.hwnd_btn_send, hfont);
                 set_font(st.hwnd_btn_cancel, hfont);
+                st.hwnd_btn_draft = b_draft;
                 st.hwnd_status = child(
                     hwnd,
                     w!("STATIC"),
@@ -415,6 +478,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 set_font(st.hwnd_status, hfont);
                 layout(hwnd, st);
             }
+            // Автосохранение черновика каждые 20 с, пока окно открыто
+            // (порт startDraftAutosave TASK-022; таймер живёт в этом окне).
+            let _ = unsafe { SetTimer(Some(hwnd), IDT_DRAFT_AUTOSAVE, 20_000, None) };
             LRESULT(0)
         }
         WM_SIZE => {
@@ -440,14 +506,100 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         unsafe { on_send(hwnd) };
                         return LRESULT(0);
                     }
+                    IDC_BTN_DRAFT => {
+                        unsafe { save_draft_flow(hwnd, true) };
+                        return LRESULT(0);
+                    }
                     IDC_BTN_CANCEL => {
-                        let _ = unsafe { DestroyWindow(hwnd) };
+                        // «Закрыть» — через WM_CLOSE: черновик сохраняется
+                        // (TASK-N08), а не выбрасывается.
+                        let _ = unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                Some(hwnd),
+                                WM_CLOSE,
+                                WPARAM(0),
+                                LPARAM(0),
+                            )
+                        };
                         return LRESULT(0);
                     }
                     _ => {}
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_CLOSE => {
+            // Крестик/«Закрыть»/Alt+F4 (TASK-N08, порт closeCompose(true)):
+            // изменившееся — сохраняем в черновики и закрываемся по ответу;
+            // пустое и неотредактированное — просто закрываем. Отправка в
+            // пути — закрываем сразу: черновик приберёт сама отправка.
+            let sending = unsafe { st_of(hwnd) }.is_some_and(|st| st.sending);
+            let posted = !sending && unsafe { save_draft_flow(hwnd, false) };
+            if posted {
+                if let Some(st) = unsafe { st_of(hwnd) } {
+                    st.closing_saving = true;
+                    let _ = set_text(st.hwnd_status, "сохраняю черновик...");
+                }
+            } else {
+                let _ = unsafe { DestroyWindow(hwnd) };
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == IDT_DRAFT_AUTOSAVE => {
+            // Тик автосохранения (20 с): изменилось с прошлого раза —
+            // ставим задачу, нет — ничего не делаем (порт saveDraftNow(true)).
+            let _ = unsafe { save_draft_flow(hwnd, false) };
+            LRESULT(0)
+        }
+        WM_APP_DRAFT_SAVED => {
+            // Ответ рабочего потока на сохранение черновика (TASK-N08).
+            let outcome = unsafe { Box::from_raw(lparam.0 as *mut DraftSaved) };
+            let Some(st) = (unsafe { st_of(hwnd) }) else {
+                return LRESULT(0);
+            };
+            if outcome.ok {
+                st.draft_saved = true;
+                st.last_print = outcome.print.clone();
+                let text = if outcome.msg.is_empty() {
+                    outcome.label.clone()
+                } else {
+                    format!("{} ({})", outcome.label, outcome.msg)
+                };
+                let _ = set_text(st.hwnd_status, &text);
+                if st.closing_saving {
+                    let _ = unsafe { DestroyWindow(hwnd) };
+                }
+            } else if st.closing_saving {
+                // Не сохранилось и мы закрывались — не теряем текст молча:
+                // спросить, закрывать ли без сохранения.
+                st.closing_saving = false;
+                let text = wide(&format!(
+                    "Черновик не сохранился: {}\n\nЗакрыть окно без сохранения?",
+                    outcome.msg
+                ));
+                let answer = unsafe {
+                    MessageBoxW(
+                        Some(hwnd),
+                        PCWSTR(text.as_ptr()),
+                        w!("POS Mail"),
+                        MB_YESNO | MB_ICONERROR,
+                    )
+                };
+                if answer == windows::Win32::UI::WindowsAndMessaging::IDYES {
+                    let _ = unsafe { DestroyWindow(hwnd) };
+                } else {
+                    let _ = set_text(
+                        st.hwnd_status,
+                        &format!("черновик не сохранился: {}", outcome.msg),
+                    );
+                }
+            } else {
+                let _ = set_text(
+                    st.hwnd_status,
+                    &format!("черновик не сохранился: {}", outcome.msg),
+                );
+            }
+            LRESULT(0)
         }
         WM_APP_SEND_RESULT => {
             let Some(st) = (unsafe { st_of(hwnd) }) else {
@@ -474,6 +626,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
+            // Таймер автосохранения гаснет вместе с окном (TASK-N08).
+            let _ = unsafe { KillTimer(Some(hwnd), IDT_DRAFT_AUTOSAVE) };
             // Геометрия окна — в layout.json (TASK-N06).
             crate::layout_store::store_window(
                 crate::layout_store::WinKind::Compose,
@@ -665,6 +819,9 @@ unsafe fn on_send(hwnd: HWND) {
         let _ = EnableWindow(st.hwnd_btn_send, false);
         let _ = set_text(st.hwnd_status, "отправка...");
     }
+    // Черновик этого окна (если сохранялся) отправка уберёт сама
+    // (draft_id у задачи; TASK-N08).
+    let draft_id = st.draft_saved.then(|| st.draft_id.clone());
     st.backend
         .send(Job::SendMail {
             hwnd_reply: hwnd,
@@ -674,6 +831,62 @@ unsafe fn on_send(hwnd: HWND) {
             subject,
             body,
             atts: st.atts.clone(),
+            draft_id,
         })
         .ok();
+}
+
+/// Сохранить черновик, если есть что и с последнего раза изменилось (порт
+/// saveDraftNow, TASK-022/N08): кнопка «В черновики», автотаймер 20 с,
+/// закрытие окна. Возвращает true, если в рабочий поток ушла новая задача
+/// сохранения (закрывающееся окно дождётся ответа перед DestroyWindow).
+unsafe fn save_draft_flow(hwnd: HWND, manual: bool) -> bool {
+    let Some(st) = (unsafe { st_of(hwnd) }) else {
+        return false;
+    };
+    if st.sending {
+        return false;
+    }
+    let to = read_text(st.hwnd_to);
+    let cc = read_text(st.hwnd_cc);
+    let subject = read_text(st.hwnd_subject);
+    let body = read_text(st.hwnd_body);
+    // Пустой черновик не сохраняем: нечего (прежняя серверная копия,
+    // если была, остаётся в папке — удаляется оттуда, как обычное письмо).
+    if crate::draft::is_empty(&to, &cc, &subject, &body, st.atts.len()) {
+        if manual && st.draft_saved {
+            let _ = set_text(
+                st.hwnd_status,
+                "черновик пуст — прежняя копия остаётся в папке",
+            );
+        }
+        return false;
+    }
+    let att_meta: Vec<(&str, u64)> = st
+        .atts
+        .iter()
+        .map(|a| (a.name.as_str(), a.data.len() as u64))
+        .collect();
+    let print = crate::draft::fingerprint(&to, &cc, &subject, &body, &att_meta);
+    if st.draft_saved && print == st.last_print {
+        if manual {
+            let _ = set_text(st.hwnd_status, "черновик уже сохранён");
+        }
+        return false;
+    }
+    st.backend
+        .send(Job::SaveDraft {
+            hwnd_reply: hwnd,
+            account_id: st.account_id.clone(),
+            draft_id: st.draft_id.clone(),
+            to,
+            cc,
+            subject,
+            body,
+            atts: st.atts.clone(),
+            print,
+        })
+        .ok();
+    let _ = set_text(st.hwnd_status, "сохраняю черновик...");
+    true
 }
