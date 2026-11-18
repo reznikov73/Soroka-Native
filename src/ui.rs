@@ -4,47 +4,47 @@
 //! Все функции вызываются только из UI-потока. Блокирующие операции уходят
 //! в `backend` (рабочий поток), сюда возвращаются события через WM_APP_MAIL.
 
-use windows::core::{Error, HSTRING, PCWSTR, w};
 use windows::Win32::Foundation::{
     E_UNEXPECTED, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, CreateFontIndirectW,
-    EndPaint, FillRect, GetSysColorBrush, InvalidateRect, LOGFONTW, PAINTSTRUCT,
-    SelectObject, HFONT, HGDIOBJ,
+    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ, InvalidateRect,
+    LOGFONTW, PAINTSTRUCT, SelectObject, SetBkColor, SetTextColor,
 };
 use windows::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
-    CDRF_NOTIFYSUBITEMDRAW, HTREEITEM, LVCOLUMNW, LVCF_TEXT, LVCF_WIDTH, LVM_DELETECOLUMN,
-    LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVIF_TEXT, NMCUSTOMDRAW, NMLISTVIEW, NMLVDISPINFOW,
-    NMTREEVIEWW, TVGN_CARET, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW,
-    TVINSERTSTRUCTW_0, TVI_LAST, TVI_ROOT, TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW,
-    TVM_SELECTITEM, TVE_EXPAND, WM_MOUSELEAVE,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
+    CDRF_NOTIFYSUBITEMDRAW, HTREEITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT,
+    LVM_DELETECOLUMN, LVM_INSERTCOLUMNW, LVM_SETBKCOLOR, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMCOUNT, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMTREEVIEWW, TVE_EXPAND,
+    TVGN_CARET, TVI_LAST, TVI_ROOT, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0,
+    TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETBKCOLOR,
+    TVM_SETLINECOLOR, TVM_SETTEXTCOLOR, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    DefWindowProcW, GetClientRect, GetWindowLongPtrW, GWLP_USERDATA, IDC_SIZEWE, KillTimer,
-    LoadCursorW, MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR, MF_STRING, RegisterClassW,
-    SendMessageW, SetMenu, SetWindowLongPtrW, ShowWindow, HACCEL, ACCEL,
-    CreateAcceleratorTableW, SW_HIDE, SW_SHOW, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY,
-    NONCLIENTMETRICSW, WNDCLASSW, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SIZE,
+    ACCEL, AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateAcceleratorTableW, CreateMenu,
+    CreatePopupMenu, DefWindowProcW, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, GWLP_USERDATA,
+    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HACCEL,
+    IDC_ARROW, IDC_SIZEWE, KillTimer, LoadCursorW, MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, NONCLIENTMETRICSW, RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetMenu,
+    SetWindowLongPtrW, ShowWindow, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SIZE, WNDCLASSW,
 };
+use windows::core::{Error, HSTRING, PCWSTR, w};
 
 use crate::backend::{BodyData, MailEvent};
+use crate::dates;
 use crate::layout_store;
 use crate::mail::accounts::{load_accounts, split_key};
 use crate::mail::imap::MessageHeader;
 use crate::mail::store::Store;
 use crate::state::{AppState, ListRow, PaneBody, TreeSlot};
-use crate::wide::{escape_html, wide};
-
-/// Сообщение статус-бара (SB_SETTEXTW из commctrl: WM_USER + 11).
-pub const SB_SET_TEXT: u32 = 0x040B;
+use crate::theme;
+use crate::wide::{escape_html, set_window_text, wide};
 
 /// Раскладка, px (TASK-N04): дерево | сплиттер | список | сплиттер | тело.
 pub const STATUS_H: i32 = 26;
@@ -74,6 +74,7 @@ pub const IDM_TOGGLE_SEEN: u16 = 125;
 pub const IDM_SEARCH_FOCUS: u16 = 130;
 pub const IDM_SEARCH_GO: u16 = 131;
 pub const IDM_SEARCH_CLOSE: u16 = 132;
+pub const IDM_THEME: u16 = 133;
 
 /// EN_CHANGE — уведомление EDIT о вводе (приходит через WM_COMMAND).
 /// В windows-rs константа лежит в WindowsAndMessaging — локальный псевдоним надёжен.
@@ -97,17 +98,11 @@ pub fn copy_utf16(dst: windows::core::PWSTR, cap: i32, text: &str) {
     unsafe { *dst.0.add(written) = 0 };
 }
 
-/// Текст в статус-бар.
+/// Текст в статус-бар (с TASK-N05 — собственное окно SorokaNativeStatus,
+/// красится палитрой темы; текст хранится в заголовке окна через
+/// SetWindowTextW/GetWindowTextW).
 pub fn status_text(st: &AppState, text: &str) {
-    let mut buf = wide(text);
-    unsafe {
-        SendMessageW(
-            st.hwnd_status,
-            SB_SET_TEXT,
-            Some(WPARAM(0)),
-            Some(LPARAM(buf.as_mut_ptr() as isize)),
-        );
-    }
+    let _ = set_window_text(st.hwnd_status, text);
 }
 
 /// Системный шрифт интерфейса + его полужирная версия (для непрочитанных).
@@ -151,6 +146,7 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
         let bar = CreateMenu()?;
         let mail = CreatePopupMenu()?;
         let folder = CreatePopupMenu()?;
+        let view = CreatePopupMenu()?;
         let accounts = CreatePopupMenu()?;
         let file = CreatePopupMenu()?;
 
@@ -171,7 +167,12 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
             IDM_REPLY_ALL as usize,
             w!("Ответить всем\tCtrl+Shift+R"),
         );
-        item(mail, MF_STRING, IDM_FORWARD as usize, w!("Переслать...\tCtrl+F"));
+        item(
+            mail,
+            MF_STRING,
+            IDM_FORWARD as usize,
+            w!("Переслать...\tCtrl+F"),
+        );
         item(mail, MF_SEPARATOR, 0, PCWSTR::null());
         item(mail, MF_STRING, IDM_DELETE as usize, w!("Удалить\tDel"));
         item(
@@ -187,7 +188,16 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
             IDM_SEARCH_FOCUS as usize,
             w!("Найти в ящике...\t/"),
         );
-        item(folder, MF_STRING, IDM_SYNC as usize, w!("Синхронизировать\tF5"));
+        item(
+            folder,
+            MF_STRING,
+            IDM_SYNC as usize,
+            w!("Синхронизировать\tF5"),
+        );
+
+        // TASK-N05: переключение темы. Галочка ставится/снимается при старте
+        // и переключении (CheckMenuItem в main.rs) — тема в layout.json.
+        item(view, MF_STRING, IDM_THEME as usize, w!("Тёмная тема"));
 
         item(
             accounts,
@@ -200,6 +210,7 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
 
         item(bar, MF_POPUP, mail.0 as usize, w!("&Почта"));
         item(bar, MF_POPUP, folder.0 as usize, w!("&Папка"));
+        item(bar, MF_POPUP, view.0 as usize, w!("&Вид"));
         item(bar, MF_POPUP, accounts.0 as usize, w!("&Ящики"));
         item(bar, MF_POPUP, file.0 as usize, w!("&Файл"));
 
@@ -324,9 +335,14 @@ unsafe extern "system" fn splitter_proc(
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             let mut rc = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut rc) };
-            unsafe { FillRect(hdc, &rc, GetSysColorBrush(COLOR_BTNFACE)) };
-            // Полоса-хват 3×36px по центру — как .splitter-v::after в Soroka;
-            // при наведении/жесте — цвет акцента (до N05 — системный highlight).
+            // Палитра темы (TASK-N05): фон — как у панелей, хват — штрих,
+            // при наведении/жесте — акцент Soroka (вместо системных цветов,
+            // долг из TASK-N04).
+            let st = unsafe { &*(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *const AppState) };
+            let p = theme::palette(st.dark);
+            let bg = unsafe { CreateSolidBrush(p.bg) };
+            unsafe { FillRect(hdc, &rc, bg) };
+            // Полоса-хват 3×36px по центру — как .splitter-v::after в Soroka.
             let cx = (rc.left + rc.right) / 2;
             let cy = (rc.top + rc.bottom) / 2;
             let line = RECT {
@@ -335,13 +351,18 @@ unsafe extern "system" fn splitter_proc(
                 right: cx + 2,
                 bottom: cy + 18,
             };
-            let color = if ctx.hover || ctx.captured {
-                COLOR_HIGHLIGHT
+            let grip_color = if ctx.hover || ctx.captured {
+                p.accent
             } else {
-                COLOR_GRAYTEXT
+                p.stroke
             };
-            unsafe { FillRect(hdc, &line, GetSysColorBrush(color)) };
-            let _ = unsafe { EndPaint(hwnd, &ps) };
+            let grip = unsafe { CreateSolidBrush(grip_color) };
+            unsafe { FillRect(hdc, &line, grip) };
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(bg.0));
+                let _ = DeleteObject(HGDIOBJ(grip.0));
+                let _ = EndPaint(hwnd, &ps);
+            }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -366,9 +387,10 @@ unsafe extern "system" fn splitter_proc(
                 // dx — клиентские координаты самой полосы: capture доставляет
                 // WM_MOUSEMOVE и за пределами окна, координаты остаются корректными.
                 let x = ((lparam.0 as usize) & 0xFFFF) as u16 as i16 as i32;
-                let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
-                let pa = (ctx.start_a_px + (x - ctx.start_x))
-                    .clamp(PANE_MIN, ctx.sum_px - PANE_MIN);
+                let st =
+                    unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
+                let pa =
+                    (ctx.start_a_px + (x - ctx.start_x)).clamp(PANE_MIN, ctx.sum_px - PANE_MIN);
                 let wa = ctx.sum_w * pa as f64 / ctx.sum_px as f64;
                 if ctx.pane {
                     st.wl = wa;
@@ -424,7 +446,8 @@ unsafe extern "system" fn splitter_proc(
                 if msg == WM_LBUTTONUP {
                     let _ = unsafe { ReleaseCapture() };
                 }
-                let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
+                let st =
+                    unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
                 st.dragging = false;
                 if ctx.pane
                     && let Some(ctrl) = &st.controller
@@ -432,10 +455,9 @@ unsafe extern "system" fn splitter_proc(
                     let _ = unsafe { ctrl.SetIsVisible(true) };
                 }
                 // Финальная раскладка: панель письма получает новые bounds.
-                let _ = unsafe {
-                    SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0)))
-                };
-                layout_store::save(st.wf, st.wl, st.wr);
+                let _ =
+                    unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
+                layout_store::save(st.wf, st.wl, st.wr, st.dark);
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
             LRESULT(0)
@@ -454,10 +476,152 @@ unsafe extern "system" fn splitter_proc(
                 st.wl = WL_DEF;
             }
             let _ = unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
-            layout_store::save(st.wf, st.wl, st.wr);
+            layout_store::save(st.wf, st.wl, st.wr, st.dark);
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+// ===== Статус-бар (TASK-N05) =====
+
+/// Класс собственного статус-бара: msctls_statusbar32 не даёт задать цвет
+/// текста, тёмная тема на нём не собирается — красим сами (KISS-исключение
+/// из «системные контролы как есть»: красится там, где система не умеет).
+pub const STATUS_CLASS: PCWSTR = w!("SorokaNativeStatus");
+
+/// Регистрация класса статус-бара (один раз из run(), до создания детей).
+pub fn register_status_class(hmod: HMODULE) -> windows::core::Result<()> {
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(status_proc),
+        hInstance: HINSTANCE(hmod.0),
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
+        lpszClassName: STATUS_CLASS,
+        ..Default::default()
+    };
+    if unsafe { RegisterClassW(&wc) } == 0 {
+        return Err(Error::from(E_UNEXPECTED));
+    }
+    Ok(())
+}
+
+/// Оконная процедура статус-бара: фон палитры, верхняя линия, текст
+/// (хранится в заголовке окна — SetWindowTextW из status_text).
+unsafe extern "system" fn status_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+            let mut rc = RECT::default();
+            let _ = unsafe { GetClientRect(hwnd, &mut rc) };
+            // Палитра и шрифт — из AppState родителя (главного окна).
+            let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+            let st = unsafe { &*(GetWindowLongPtrW(parent, GWLP_USERDATA) as *const AppState) };
+            let p = theme::palette(st.dark);
+            let bg = unsafe { CreateSolidBrush(p.bg) };
+            let stroke = unsafe { CreateSolidBrush(p.stroke) };
+            unsafe {
+                FillRect(hdc, &rc, bg);
+                // Верхняя граница — линия штриха палитры.
+                FillRect(hdc, &RECT { bottom: 1, ..rc }, stroke);
+                // Текст: вторичным цветом (статус — не главный контент).
+                let len = GetWindowTextLengthW(hwnd).max(0) as usize;
+                let mut buf = vec![0u16; len + 1];
+                let got = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
+                if got > 0 {
+                    let old = SelectObject(hdc, HGDIOBJ(st.font.0));
+                    SetTextColor(hdc, p.text_dim);
+                    SetBkColor(hdc, p.bg);
+                    let mut trc = rc;
+                    trc.left += 8;
+                    trc.top += 1;
+                    let _ = DrawTextW(
+                        hdc,
+                        &mut buf[..got],
+                        &mut trc,
+                        DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+                    );
+                    SelectObject(hdc, old);
+                }
+                let _ = DeleteObject(HGDIOBJ(bg.0));
+                let _ = DeleteObject(HGDIOBJ(stroke.0));
+                let _ = EndPaint(hwnd, &ps);
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Применить тему к оболочке (TASK-N05): дерево, список, сплиттеры,
+/// статус-бар, поле поиска. Вызывается при старте (до показа окна —
+/// без вспышки системных цветов) и при переключении «Вид → Тёмная тема».
+/// Панель письма пере-навигируется отдельно (main.rs: там нужен WebView2).
+pub fn apply_theme(st: &mut AppState) {
+    let p = theme::palette(st.dark);
+    unsafe {
+        // Дерево: фон, текст, линии — TVM-сообщения (выделение остаётся
+        // системным, как и у списка: контрол красит его сам).
+        SendMessageW(
+            st.hwnd_tree,
+            TVM_SETBKCOLOR,
+            Some(WPARAM(0)),
+            Some(LPARAM(p.bg.0 as isize)),
+        );
+        SendMessageW(
+            st.hwnd_tree,
+            TVM_SETTEXTCOLOR,
+            Some(WPARAM(0)),
+            Some(LPARAM(p.text.0 as isize)),
+        );
+        SendMessageW(
+            st.hwnd_tree,
+            TVM_SETLINECOLOR,
+            Some(WPARAM(0)),
+            Some(LPARAM(p.stroke.0 as isize)),
+        );
+        // Список: фон и текст; колонка даты затемняется в custom draw.
+        SendMessageW(
+            st.hwnd_list,
+            LVM_SETBKCOLOR,
+            Some(WPARAM(0)),
+            Some(LPARAM(p.bg.0 as isize)),
+        );
+        SendMessageW(
+            st.hwnd_list,
+            LVM_SETTEXTCOLOR,
+            Some(WPARAM(0)),
+            Some(LPARAM(p.text.0 as isize)),
+        );
+        SendMessageW(
+            st.hwnd_list,
+            LVM_SETTEXTBKCOLOR,
+            Some(WPARAM(0)),
+            Some(LPARAM(p.bg.0 as isize)),
+        );
+    }
+    // Кисть фона поля поиска (WM_CTLCOLOREDIT): прежнюю удалить.
+    if !st.hbr_edit.is_invalid() {
+        let _ = unsafe { DeleteObject(HGDIOBJ(st.hbr_edit.0)) };
+    }
+    st.hbr_edit = unsafe { CreateSolidBrush(p.surface) };
+    for h in [
+        st.hwnd_tree,
+        st.hwnd_list,
+        st.hwnd_status,
+        st.hwnd_split_tree,
+        st.hwnd_split_pane,
+        st.hwnd_search,
+    ] {
+        unsafe {
+            let _ = InvalidateRect(Some(h), None, true);
+        }
     }
 }
 
@@ -472,7 +636,9 @@ pub fn setup_list_columns(hwnd_list: HWND) {
             hwnd_list,
             LVM_SETEXTENDEDLISTVIEWSTYLE,
             Some(WPARAM(0)),
-            Some(LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize)),
+            Some(LPARAM(
+                (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize,
+            )),
         );
     }
 }
@@ -502,12 +668,7 @@ pub fn set_list_columns(hwnd_list: HWND, search: bool) {
     let old = if search { 4 } else { 5 };
     unsafe {
         for _ in 0..old {
-            SendMessageW(
-                hwnd_list,
-                LVM_DELETECOLUMN,
-                Some(WPARAM(0)),
-                None,
-            );
+            SendMessageW(hwnd_list, LVM_DELETECOLUMN, Some(WPARAM(0)), None);
         }
     }
     if search {
@@ -711,12 +872,7 @@ pub fn enter_search(hwnd_list: HWND, st: &mut AppState) {
         st.selected_uid = None;
         st.pane_body = None;
         unsafe {
-            SendMessageW(
-                hwnd_list,
-                LVM_SETITEMCOUNT,
-                Some(WPARAM(0)),
-                None,
-            );
+            SendMessageW(hwnd_list, LVM_SETITEMCOUNT, Some(WPARAM(0)), None);
             let _ = ShowWindow(st.hwnd_search, SW_SHOW);
         }
     }
@@ -749,12 +905,7 @@ pub fn exit_search(hwnd: HWND, hwnd_list: HWND, st: &mut AppState) {
     } else {
         st.rows.clear();
         unsafe {
-            SendMessageW(
-                hwnd_list,
-                LVM_SETITEMCOUNT,
-                Some(WPARAM(0)),
-                None,
-            );
+            SendMessageW(hwnd_list, LVM_SETITEMCOUNT, Some(WPARAM(0)), None);
         }
         status_text(st, "выберите папку");
     }
@@ -790,17 +941,15 @@ pub fn fire_search(hwnd: HWND, hwnd_list: HWND, st: &mut AppState) {
     st.selected_uid = None;
     st.pane_body = None;
     unsafe {
-        SendMessageW(
-            hwnd_list,
-            LVM_SETITEMCOUNT,
-            Some(WPARAM(0)),
-            None,
-        );
+        SendMessageW(hwnd_list, LVM_SETITEMCOUNT, Some(WPARAM(0)), None);
         let _ = InvalidateRect(Some(hwnd_list), None, false);
     }
     status_text(st, &format!("ищу «{q}»…"));
     if let Some(b) = &st.backend {
-        b.post(crate::backend::Job::Search { account_id, query: q });
+        b.post(crate::backend::Job::Search {
+            account_id,
+            query: q,
+        });
     }
 }
 
@@ -824,24 +973,91 @@ pub fn on_get_disp_info(st: &mut AppState, nm: &mut NMLVDISPINFOW) {
         // В режиме поиска колонка 3 — папка письма; в режиме папки — дата.
         3 => match &row.folder {
             Some(key) => folder_display(&split_key(key).1),
-            None => row.hdr.date.clone(),
+            None => list_date(&row.hdr.date),
         },
-        _ => row.hdr.date.clone(),
+        _ => list_date(&row.hdr.date),
     };
     copy_utf16(nm.item.pszText, nm.item.cchTextMax, &text);
 }
 
-/// Ответ NM_CUSTOMDRAW списка: непрочитанные — полужирным.
-/// На каждый ITEMPREPAINT (включая сабайтемы) выбираем нужный шрифт заново.
-pub fn on_list_custom_draw(st: &AppState, nm: &NMCUSTOMDRAW) -> LRESULT {
-    match nm.dwDrawStage {
+/// Локальное «сейчас»: (Unix-время UTC, смещение зоны в секундах).
+/// Смещение — из пары GetLocalTime/GetSystemTime (DST-переходы дают
+/// небольшую неточность на старых письмах — для «сегодня/вчера» неважно).
+fn local_now_off() -> (i64, i64) {
+    use windows::Win32::Foundation::SYSTEMTIME;
+    use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+    let st_unix = |st: &SYSTEMTIME| {
+        dates::from_ymdhms(
+            st.wYear as i64,
+            st.wMonth as u32,
+            st.wDay as u32,
+            st.wHour as u32,
+            st.wMinute as u32,
+            st.wSecond as u32,
+        )
+    };
+    unsafe {
+        let lt = GetLocalTime();
+        let utc = GetSystemTime();
+        let l = st_unix(&lt);
+        let u = st_unix(&utc);
+        (u, l - u)
+    }
+}
+
+/// Дата строки списка: «сегодня, 14:32» / «вчера» / «12 ноября» (TASK-N05).
+/// Что не разобралось — показываем сырую строку заголовка.
+fn list_date(raw: &str) -> String {
+    let (now, off) = local_now_off();
+    match dates::parse_rfc5322(raw) {
+        Some(ts) => dates::fmt_list(ts, now, off),
+        None => raw.trim().to_string(),
+    }
+}
+
+/// Дата шапки письма: полный формат «18 ноября 2026, 14:32».
+fn full_date(raw: &str) -> String {
+    let (now, off) = local_now_off();
+    match dates::parse_rfc5322(raw) {
+        Some(ts) => dates::fmt_full(ts, now, off),
+        None => raw.trim().to_string(),
+    }
+}
+
+/// Ответ NM_CUSTOMDRAW списка: непрочитанные — полужирным, цвета —
+/// палитра темы (TASK-N05). На каждый ITEMPREPAINT (включая сабайтемы)
+/// выбираем нужный шрифт и цвет заново.
+///
+/// lv — сырой указатель уведомления: список присылает NMLVCUSTOMDRAW
+/// (расширение NMCUSTOMDRAW), цвета меняются в нём же.
+///
+/// Выделенная строка красится системой (синий + белый, как у дерева —
+/// контрол делает это сам): палитру в выделение не вмешиваем; owner-draw
+/// строки — отдельная задача N10, если понадобится.
+pub fn on_list_custom_draw(st: &AppState, lv: *mut NMLVCUSTOMDRAW) -> LRESULT {
+    let (stage, item, state, hdc) = unsafe {
+        let nm = &(*lv).nmcd;
+        (nm.dwDrawStage, nm.dwItemSpec, nm.uItemState, nm.hdc)
+    };
+    match stage {
         CDDS_PREPAINT => LRESULT(CDRF_NOTIFYITEMDRAW as isize),
         stage if stage.0 & CDDS_ITEMPREPAINT.0 != 0 => {
-            let i = nm.dwItemSpec;
-            let bold = st.rows.get(i).is_some_and(|r| !r.hdr.seen);
+            let bold = st.rows.get(item).is_some_and(|r| !r.hdr.seen);
             let hfont = if bold { st.font_bold } else { st.font };
             unsafe {
-                SelectObject(nm.hdc, HGDIOBJ(hfont.0));
+                SelectObject(hdc, HGDIOBJ(hfont.0));
+            }
+            if (state & CDIS_SELECTED).0 == 0 {
+                // Свободная строка: колонка даты — вторичным цветом,
+                // остальное — основным (цвета темы).
+                let lv = unsafe { &mut *lv };
+                let p = theme::palette(st.dark);
+                let date_col: i32 = if st.search_query.is_some() { 4 } else { 3 };
+                lv.clrText = if lv.iSubItem == date_col {
+                    p.text_dim
+                } else {
+                    p.text
+                };
             }
             LRESULT(CDRF_NOTIFYSUBITEMDRAW as isize)
         }
@@ -877,7 +1093,8 @@ pub fn on_list_item_changed(st: &mut AppState, nm: &NMLISTVIEW) {
     }
     // Плейсхолдер, пока бэкенд тащит тело (кэш — мгновенно).
     if let Some(wv) = &st.webview {
-        let _ = unsafe { wv.NavigateToString(&HSTRING::from(loading_html(&row.hdr.subject))) };
+        let _ =
+            unsafe { wv.NavigateToString(&HSTRING::from(loading_html(&row.hdr.subject, st.dark))) };
     }
     status_text(st, &format!("загрузка письма {}…", row.hdr.subject));
     if let Some(b) = &st.backend {
@@ -899,8 +1116,10 @@ fn fmt_size(bytes: u32) -> String {
     }
 }
 
-/// Тёмный шаблон панели письма (WebView2), как в шипе Фазы 0.
-pub fn letter_html(hdr: &MessageHeader, body: &BodyData) -> String {
+/// Шаблон панели письма (WebView2) в палитре темы (TASK-N05: цвета —
+/// переменные Soroka из styles.css, тёмная тема — дефолт).
+pub fn letter_html(hdr: &MessageHeader, body: &BodyData, dark: bool) -> String {
+    let p = theme::palette(dark);
     let atts = if body.attachments.is_empty() {
         String::new()
     } else {
@@ -936,47 +1155,61 @@ pub fn letter_html(hdr: &MessageHeader, body: &BodyData) -> String {
     };
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><style>
-body {{ font-family: 'Segoe UI', sans-serif; background: #ffffff; color: #1f2937; margin: 0; }}
-.hdr {{ padding: 14px 20px 12px; border-bottom: 1px solid #e3e7ee; background: #f7f8fa; }}
+body {{ font-family: 'Segoe UI', sans-serif; background: {bg}; color: {text}; margin: 0; }}
+.hdr {{ padding: 14px 20px 12px; border-bottom: 1px solid {border}; background: {hdr}; }}
 h1 {{ font-size: 17px; font-weight: 600; margin: 0 0 6px; }}
-.meta {{ color: #6b7280; font-size: 13px; line-height: 1.5; }}
-.atts {{ padding: 8px 20px; border-bottom: 1px solid #e3e7ee; font-size: 13px; color: #4b5563; }}
-.atts a {{ color: #2563eb; text-decoration: none; border-bottom: 1px dotted #2563eb; }}
-.warn {{ padding: 8px 20px; color: #92400e; font-size: 12px; border-bottom: 1px solid #e3e7ee; }}
+.meta {{ color: {meta}; font-size: 13px; line-height: 1.5; }}
+.atts {{ padding: 8px 20px; border-bottom: 1px solid {border}; font-size: 13px; color: {meta}; }}
+.atts a {{ color: {link}; text-decoration: none; border-bottom: 1px dotted {link}; }}
+.warn {{ padding: 8px 20px; color: {warn}; font-size: 12px; border-bottom: 1px solid {border}; }}
 .body {{ padding: 16px 20px; line-height: 1.55; font-size: 14px; }}
 pre {{ white-space: pre-wrap; word-wrap: break-word; font-family: 'Segoe UI', Consolas, monospace; }}
 img {{ max-width: 100%; }}
 </style></head><body>
-<div class="hdr"><h1>{}</h1><div class="meta">От: {}<br>Кому: {}<br>{}</div></div>
-{}{}
-<div class="body">{}</div>
+<div class="hdr"><h1>{subject}</h1><div class="meta">От: {from}<br>Кому: {to}<br>{date}</div></div>
+{atts}{truncated}
+<div class="body">{inner}</div>
 </body></html>"#,
-        escape_html(&hdr.subject),
-        escape_html(&hdr.from),
-        escape_html(&hdr.to),
-        escape_html(&hdr.date),
-        atts,
-        truncated,
-        inner
+        bg = p.pane_bg,
+        text = p.pane_text,
+        border = p.pane_border,
+        hdr = p.pane_hdr,
+        meta = p.pane_meta,
+        link = p.pane_link,
+        warn = p.pane_warn,
+        subject = escape_html(&hdr.subject),
+        from = escape_html(&hdr.from),
+        to = escape_html(&hdr.to),
+        date = escape_html(&full_date(&hdr.date)),
+        atts = atts,
+        truncated = truncated,
+        inner = inner,
     )
 }
 
-/// Заглушка «загружается».
-fn loading_html(subject: &str) -> String {
+/// Заглушка «загружается» в палитре темы.
+fn loading_html(subject: &str, dark: bool) -> String {
+    let p = theme::palette(dark);
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><style>
-body {{ font-family: 'Segoe UI', sans-serif; background: #f7f8fa; color: #6b7280; margin: 24px; }}
-</style></head><body>Загрузка «{}»…</body></html>"#,
-        escape_html(subject)
+body {{ font-family: 'Segoe UI', sans-serif; background: {bg}; color: {meta}; margin: 24px; }}
+</style></head><body>Загрузка «{subject}»…</body></html>"#,
+        bg = p.pane_bg,
+        meta = p.pane_meta,
+        subject = escape_html(subject)
     )
 }
 
-/// Пустая панель: папка выбрана, письмо — нет.
-pub fn empty_pane_html() -> String {
-    r#"<!doctype html><html><head><meta charset="utf-8"><style>
-body { font-family: 'Segoe UI', sans-serif; background: #f7f8fa; color: #6b7280; margin: 24px; }
-</style></head><body>Выберите письмо в списке.</body></html>"#
-        .to_string()
+/// Пустая панель: папка выбрана, письмо — нет. В палитре темы.
+pub fn empty_pane_html(dark: bool) -> String {
+    let p = theme::palette(dark);
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><style>
+body {{ font-family: 'Segoe UI', sans-serif; background: {bg}; color: {meta}; margin: 24px; }}
+</style></head><body>Выберите письмо в списке.</body></html>"#,
+        bg = p.pane_bg,
+        meta = p.pane_meta
+    )
 }
 
 /// Показ тела письма в панели (вызывается на BodyReady).
@@ -993,21 +1226,23 @@ pub fn show_body(st: &mut AppState, key: &str, uid: u32, from_cache: bool, body:
         uid,
         text: body.text.clone(),
         html: body.html.clone(),
+        attachments: body.attachments.clone(),
+        truncated: body.truncated,
     });
     if let Some(wv) = &st.webview {
-        let _ = unsafe { wv.NavigateToString(&HSTRING::from(letter_html(&hdr, &body))) };
+        let _ = unsafe { wv.NavigateToString(&HSTRING::from(letter_html(&hdr, &body, st.dark))) };
     }
     status_text(
         st,
-        &format!(
-            "{}{}",
-            hdr.subject,
-            if from_cache { " (кэш)" } else { "" }
-        ),
+        &format!("{}{}", hdr.subject, if from_cache { " (кэш)" } else { "" }),
     );
     // Прочитано — на сервер и в кэш (как set_seen в Soroka).
     if was_unread && let Some(b) = &st.backend {
-        b.post(crate::backend::Job::SetSeen { key: key.to_string(), uid, seen: true });
+        b.post(crate::backend::Job::SetSeen {
+            key: key.to_string(),
+            uid,
+            seen: true,
+        });
     }
 }
 
@@ -1033,17 +1268,12 @@ pub fn apply_mail_event(
                 rebuild_tree_keep(hwnd_tv, hwnd_list, st, sel);
             }
             // Во время поиска список не подменяем выдачей папки — только статус.
-            if st.search_query.is_none()
-                && st.current_folder.as_deref() == Some(key.as_str())
-            {
+            if st.search_query.is_none() && st.current_folder.as_deref() == Some(key.as_str()) {
                 show_folder(hwnd_list, st, &key);
             }
             match error {
                 Some(err) => status_text(st, &format!("сеть: {err}")),
-                None => status_text(
-                    st,
-                    &format!("{key}: всего {total}, загружено {fetched}"),
-                ),
+                None => status_text(st, &format!("{key}: всего {total}, загружено {fetched}")),
             }
         }
         MailEvent::BodyReady {
@@ -1091,7 +1321,7 @@ pub fn apply_mail_event(
                     st.pane_body = None;
                     if let Some(wv) = &st.webview {
                         let _ = unsafe {
-                            wv.NavigateToString(&HSTRING::from(empty_pane_html()))
+                            wv.NavigateToString(&HSTRING::from(empty_pane_html(st.dark)))
                         };
                     }
                 }
@@ -1115,7 +1345,10 @@ pub fn apply_mail_event(
             status_text(st, &format!("вложение: {error}"));
         }
         MailEvent::OutboxFlushed { sent } => {
-            status_text(st, &format!("очередь: отправлено писем, ждавших сети: {sent}"));
+            status_text(
+                st,
+                &format!("очередь: отправлено писем, ждавших сети: {sent}"),
+            );
         }
         MailEvent::SearchDone { query, hits } => {
             // Режим поиска уже закрыт или сменился запрос — выдача устарела.
@@ -1172,7 +1405,10 @@ fn rebuild_tree_keep(hwnd_tv: HWND, hwnd_list: HWND, st: &mut AppState, sel: Opt
     rebuild_tree(hwnd_tv, st);
     if let Some(key) = sel
         && st.search_query.is_none()
-        && st.tree_slots.iter().any(|s| matches!(s, TreeSlot::Folder { key: k, .. } if *k == key))
+        && st
+            .tree_slots
+            .iter()
+            .any(|s| matches!(s, TreeSlot::Folder { key: k, .. } if *k == key))
     {
         show_folder(hwnd_list, st, &key);
     }

@@ -1,11 +1,12 @@
 //! Состояние главного окна (живёт в GWLP_USERDATA, трогается только UI-потоком).
 
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Gdi::HFONT;
 use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2, ICoreWebView2Controller};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Gdi::{HBRUSH, HFONT};
 
 use crate::backend::Backend;
 use crate::mail::accounts::Account;
+use crate::mail::body::AttachmentMeta;
 use crate::mail::imap::MessageHeader;
 use crate::ui::{WF_DEF, WL_DEF, WR_DEF};
 
@@ -29,10 +30,15 @@ pub struct ListRow {
 }
 
 /// Тело текущего письма (для показа и цитирования при ответе).
+/// С TASK-N05 хранит и вложения с признаком обрезки — чтобы переключение
+/// темы могло перерисовать панель без похода в бэкенд.
+#[derive(Clone)]
 pub struct PaneBody {
     pub uid: u32,
     pub text: Option<String>,
     pub html: Option<String>,
+    pub attachments: Vec<AttachmentMeta>,
+    pub truncated: bool,
 }
 
 /// Главное состояние приложения.
@@ -84,6 +90,10 @@ pub struct AppState {
     /// Идёт жест сплиттера — SetBounds панели письма отложен до отпускания
     /// (WebView2 не участвует в кадре жеста, правило WORKFLOW).
     pub dragging: bool,
+    /// Тёмная тема (дефолт — как в Soroka; TASK-N05). Хранится в layout.json.
+    pub dark: bool,
+    /// Кисть фона поля поиска (WM_CTLCOLOREDIT; пересоздаётся при смене темы).
+    pub hbr_edit: HBRUSH,
     pub controller: Option<ICoreWebView2Controller>,
     pub webview: Option<ICoreWebView2>,
 
@@ -119,6 +129,8 @@ impl AppState {
             list_px: 0,
             pane_px: 0,
             dragging: false,
+            dark: true,
+            hbr_edit: HBRUSH::default(),
             controller: None,
             webview: None,
             font,

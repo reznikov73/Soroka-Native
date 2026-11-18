@@ -18,6 +18,7 @@ mod account_dlg;
 mod ai;
 mod backend;
 mod compose;
+mod dates;
 mod layout_store;
 // Ядро Soroka перенесено дословно (правило WORKFLOW: src/mail/ не редактировать).
 // Часть его API (контакты, IDLE, пресеты провайдеров) подключается в Фазах 2–3 —
@@ -27,6 +28,7 @@ mod layout_store;
 #[allow(dead_code, clippy::needless_borrow)]
 mod mail;
 mod state;
+mod theme;
 mod ui;
 mod wide;
 
@@ -34,53 +36,57 @@ use std::sync::mpsc;
 
 use webview2_com::{
     CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, WebMessageReceivedEventHandler,
-    Microsoft::Web::WebView2::Win32::*, wait_with_pump,
+    CreateCoreWebView2EnvironmentCompletedHandler, Microsoft::Web::WebView2::Win32::*,
+    WebMessageReceivedEventHandler, wait_with_pump,
 };
-use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 use windows::Win32::Foundation::{
     E_POINTER, E_UNEXPECTED, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HDC, HGDIOBJ, PAINTSTRUCT,
+    SetBkColor, SetTextColor,
+};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx,
-    LVN_GETDISPINFOW, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NMHDR, NMLVDISPINFOW,
-    NMLISTVIEW, NMTREEVIEWW, NM_CUSTOMDRAW, TVN_SELCHANGEDW, WC_LISTVIEW, WC_TREEVIEW,
+    InitCommonControlsEx, LVN_GETDISPINFOW, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
+    NM_CUSTOMDRAW, NMHDR, NMLISTVIEW, NMLVDISPINFOW, NMTREEVIEWW, TVN_SELCHANGEDW, WC_LISTVIEW,
+    WC_TREEVIEW,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-    DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, GA_ROOT, GetAncestor,
-    GetClientRect, GetMessageW, GetParent, GWLP_USERDATA, GWLP_WNDPROC, GetWindowLongPtrW,
-    IDC_ARROW, LoadCursorW, MB_ICONINFORMATION, MB_OK, MB_YESNO, MINMAXINFO, MSG, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SWP_NOZORDER, SW_SHOW, SendMessageW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateAcceleratorW, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO,
-    WM_KEYDOWN, WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW,
-    WNDPROC, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CallWindowProcW, CheckMenuItem,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, GA_ROOT,
+    GWLP_USERDATA, GWLP_WNDPROC, GetAncestor, GetClientRect, GetMenu, GetMessageW, GetParent,
+    GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_BYCOMMAND,
+    MF_CHECKED, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassW, SW_SHOW, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR,
+    WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
+use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
 use account_dlg::{WM_APP_ACCOUNT_CLOSED, WM_APP_ACCOUNT_SAVED};
-use backend::{Backend, Job, WM_APP_MAIL, WM_APP_SEND_RESULT};
+use backend::{Backend, BodyData, Job, WM_APP_MAIL, WM_APP_SEND_RESULT};
 use compose::{ComposePrefill, WM_APP_COMPOSE_CLOSED};
 use state::AppState;
 use ui::{
-    EN_CHANGE, IDT_SEARCH, PANE_MIN, SEARCH_H, SPLIT_W, SplitCtx, STATUS_H, apply_mail_event,
-    create_fonts, create_menu, empty_pane_html, enter_search, exit_search, fire_search,
-    on_get_disp_info, on_list_custom_draw, on_list_item_changed, on_tree_select, rebuild_tree,
-    register_splitter_class, setup_list_columns, status_text, IDM_ACCOUNT_ADD, IDM_COMPOSE,
-    IDM_DELETE, IDM_EXIT, IDM_FORWARD, IDM_REPLY, IDM_REPLY_ALL, IDM_SEARCH_CLOSE,
-    IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SYNC, IDM_TOGGLE_SEEN,
+    EN_CHANGE, IDM_ACCOUNT_ADD, IDM_COMPOSE, IDM_DELETE, IDM_EXIT, IDM_FORWARD, IDM_REPLY,
+    IDM_REPLY_ALL, IDM_SEARCH_CLOSE, IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SYNC, IDM_THEME,
+    IDM_TOGGLE_SEEN, IDT_SEARCH, PANE_MIN, SEARCH_H, SPLIT_W, STATUS_CLASS, STATUS_H, SplitCtx,
+    apply_mail_event, apply_theme, create_fonts, create_menu, empty_pane_html, enter_search,
+    exit_search, fire_search, letter_html, on_get_disp_info, on_list_custom_draw,
+    on_list_item_changed, on_tree_select, rebuild_tree, register_splitter_class,
+    register_status_class, setup_list_columns, status_text,
 };
 
 const WINDOW_CLASS: PCWSTR = w!("SorokaNativeWnd");
-const STATUSBAR_CLASS: PCWSTR = w!("msctls_statusbar32");
 /// EM_SETCUEBANNER (0x1501): подсказка в пустом EDIT; wparam=1 — показывать и в фокусе.
 const EM_SETCUEBANNER: u32 = 0x1501;
 
@@ -169,8 +175,15 @@ unsafe fn layout(hwnd: HWND, st: &mut AppState) {
             SWP_NOZORDER,
         );
         if !st.hwnd_status.0.is_null() && h > STATUS_H {
-            let _ =
-                SetWindowPos(st.hwnd_status, None, 0, h - STATUS_H, w, STATUS_H, SWP_NOZORDER);
+            let _ = SetWindowPos(
+                st.hwnd_status,
+                None,
+                0,
+                h - STATUS_H,
+                w,
+                STATUS_H,
+                SWP_NOZORDER,
+            );
         }
         if !st.dragging
             && let Some(ctrl) = &st.controller
@@ -197,7 +210,9 @@ fn wv_err(err: webview2_com::Error) -> Error {
 unsafe fn create_webview(parent: HWND) -> Result<(ICoreWebView2Controller, ICoreWebView2)> {
     let (tx, rx) = mpsc::channel();
     let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
-        move |error_code: Result<()>, environment: Option<ICoreWebView2Environment>| -> Result<()> {
+        move |error_code: Result<()>,
+              environment: Option<ICoreWebView2Environment>|
+              -> Result<()> {
             let env: Result<ICoreWebView2Environment> = (|| {
                 error_code?;
                 environment.ok_or_else(|| Error::from(E_POINTER))
@@ -239,37 +254,35 @@ unsafe fn create_webview(parent: HWND) -> Result<(ICoreWebView2Controller, ICore
     let mut token: i64 = 0;
     unsafe {
         webview.add_WebMessageReceived(
-            &WebMessageReceivedEventHandler::create(Box::new(
-                move |_sender, args| -> Result<()> {
-                    let Some(args) = args else {
-                        return Ok(());
-                    };
-                    let mut text = windows::core::PWSTR::null();
-                    args.TryGetWebMessageAsString(&mut text)?;
-                    if text.is_null() {
-                        return Ok(());
-                    }
-                    // PWSTR → String вручную: не зависим от вспомогательных API.
-                    let mut len = 0usize;
-                    while *text.0.add(len) != 0 {
-                        len += 1;
-                    }
-                    let units = std::slice::from_raw_parts(text.0, len);
-                    let msg = String::from_utf16_lossy(units);
-                    if let Some(idx) = msg
-                        .strip_prefix("attach:")
-                        .and_then(|n| n.trim().parse::<u32>().ok())
-                    {
-                        let _ = PostMessageW(
-                            Some(parent),
-                            WM_APP_ATTACH_CLICK,
-                            WPARAM(0),
-                            LPARAM(idx as isize),
-                        );
-                    }
-                    Ok(())
-                },
-            )),
+            &WebMessageReceivedEventHandler::create(Box::new(move |_sender, args| -> Result<()> {
+                let Some(args) = args else {
+                    return Ok(());
+                };
+                let mut text = windows::core::PWSTR::null();
+                args.TryGetWebMessageAsString(&mut text)?;
+                if text.is_null() {
+                    return Ok(());
+                }
+                // PWSTR → String вручную: не зависим от вспомогательных API.
+                let mut len = 0usize;
+                while *text.0.add(len) != 0 {
+                    len += 1;
+                }
+                let units = std::slice::from_raw_parts(text.0, len);
+                let msg = String::from_utf16_lossy(units);
+                if let Some(idx) = msg
+                    .strip_prefix("attach:")
+                    .and_then(|n| n.trim().parse::<u32>().ok())
+                {
+                    let _ = PostMessageW(
+                        Some(parent),
+                        WM_APP_ATTACH_CLICK,
+                        WPARAM(0),
+                        LPARAM(idx as isize),
+                    );
+                }
+                Ok(())
+            })),
             &mut token,
         )?;
     }
@@ -280,12 +293,12 @@ unsafe fn create_webview(parent: HWND) -> Result<(ICoreWebView2Controller, ICore
 /// Цитата исходного письма для ответа/пересылки.
 fn quote_body(hdr: &mail::imap::MessageHeader, pane: Option<&state::PaneBody>) -> String {
     let plain = match pane {
-        Some(p) => p
-            .text
-            .clone()
-            .unwrap_or_else(|| {
-                p.html.as_deref().map(mail::body::html_to_text).unwrap_or_default()
-            }),
+        Some(p) => p.text.clone().unwrap_or_else(|| {
+            p.html
+                .as_deref()
+                .map(mail::body::html_to_text)
+                .unwrap_or_default()
+        }),
         None => String::new(),
     };
     let mut cut = plain;
@@ -358,7 +371,10 @@ fn forward_prefill(st: &AppState) -> Option<ComposePrefill> {
 /// Выбранное письмо (для удаления/переключения флага).
 fn selected_header(st: &AppState) -> Option<mail::imap::MessageHeader> {
     let uid = st.selected_uid?;
-    st.rows.iter().find(|m| m.hdr.uid == uid).map(|r| r.hdr.clone())
+    st.rows
+        .iter()
+        .find(|m| m.hdr.uid == uid)
+        .map(|r| r.hdr.clone())
 }
 
 /// Сабкласс поля поиска (TASK-N03): Enter — искать, Esc — вернуться к папке.
@@ -374,7 +390,11 @@ unsafe extern "system" fn search_edit_proc(
         WM_KEYDOWN => {
             let key = wparam.0 as u16;
             if key == VK_RETURN.0 || key == VK_ESCAPE.0 {
-                let cmd = if key == VK_RETURN.0 { IDM_SEARCH_GO } else { IDM_SEARCH_CLOSE };
+                let cmd = if key == VK_RETURN.0 {
+                    IDM_SEARCH_GO
+                } else {
+                    IDM_SEARCH_CLOSE
+                };
                 // GetParent в 0.62 возвращает Result — при ошибке просто молчим.
                 let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
                 let _ = unsafe {
@@ -397,12 +417,7 @@ unsafe extern "system" fn search_edit_proc(
     unsafe { CallWindowProcW(proc, hwnd, msg, wparam, lparam) }
 }
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_NCCREATE => {
             let cs = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
@@ -448,6 +463,56 @@ unsafe extern "system" fn wndproc(
                     exit_search(hwnd, st.hwnd_list, st);
                     unsafe { layout(hwnd, st) };
                 }
+                IDM_THEME => {
+                    // TASK-N05: переключение темы. Оболочка красится
+                    // применением палитры, панель письма — пере-навигацией
+                    // (данные письма уже в pane_body — бэкенд не трогаем).
+                    st.dark = !st.dark;
+                    let menu = unsafe { GetMenu(hwnd) };
+                    if !menu.is_invalid() {
+                        unsafe {
+                            let _ = CheckMenuItem(
+                                menu,
+                                IDM_THEME as u32,
+                                MF_BYCOMMAND.0
+                                    | if st.dark {
+                                        MF_CHECKED.0
+                                    } else {
+                                        MF_UNCHECKED.0
+                                    },
+                            );
+                        }
+                    }
+                    apply_theme(st);
+                    let html = if let Some(b) = st.pane_body.as_ref()
+                        && let Some(row) = st.rows.iter().find(|r| r.hdr.uid == b.uid)
+                    {
+                        letter_html(
+                            &row.hdr,
+                            &BodyData {
+                                text: b.text.clone(),
+                                html: b.html.clone(),
+                                attachments: b.attachments.clone(),
+                                truncated: b.truncated,
+                            },
+                            st.dark,
+                        )
+                    } else {
+                        empty_pane_html(st.dark)
+                    };
+                    if let Some(wv) = &st.webview {
+                        let _ = unsafe { wv.NavigateToString(&HSTRING::from(html)) };
+                    }
+                    layout_store::save(st.wf, st.wl, st.wr, st.dark);
+                    status_text(
+                        st,
+                        if st.dark {
+                            "тема: тёмная (палитра Soroka)"
+                        } else {
+                            "тема: светлая"
+                        },
+                    );
+                }
                 IDM_EXIT => {
                     let _ = unsafe { DestroyWindow(hwnd) };
                 }
@@ -483,16 +548,14 @@ unsafe extern "system" fn wndproc(
                         st.hwnd_compose = Some(h);
                     }
                 }
-                IDM_REPLY | IDM_REPLY_ALL => {
-                    match reply_prefill(st, id == IDM_REPLY_ALL) {
-                        Some(p) => {
-                            if let Some(h) = compose::open(hwnd, st, Some(p)) {
-                                st.hwnd_compose = Some(h);
-                            }
+                IDM_REPLY | IDM_REPLY_ALL => match reply_prefill(st, id == IDM_REPLY_ALL) {
+                    Some(p) => {
+                        if let Some(h) = compose::open(hwnd, st, Some(p)) {
+                            st.hwnd_compose = Some(h);
                         }
-                        None => status_text(st, "сначала выберите письмо"),
                     }
-                }
+                    None => status_text(st, "сначала выберите письмо"),
+                },
                 IDM_FORWARD => match forward_prefill(st) {
                     Some(p) => {
                         if let Some(h) = compose::open(hwnd, st, Some(p)) {
@@ -516,7 +579,9 @@ unsafe extern "system" fn wndproc(
                     };
                     if answer == windows::Win32::UI::WindowsAndMessaging::IDYES {
                         let key = st.current_folder.clone().unwrap_or_default();
-                        if !key.is_empty() && let Some(b) = &st.backend {
+                        if !key.is_empty()
+                            && let Some(b) = &st.backend
+                        {
                             b.post(Job::DeleteMessage { key, uid: hdr.uid });
                         }
                     }
@@ -527,7 +592,9 @@ unsafe extern "system" fn wndproc(
                         return LRESULT(0);
                     };
                     let key = st.current_folder.clone().unwrap_or_default();
-                    if !key.is_empty() && let Some(b) = &st.backend {
+                    if !key.is_empty()
+                        && let Some(b) = &st.backend
+                    {
                         b.post(Job::SetSeen {
                             key,
                             uid: hdr.uid,
@@ -550,8 +617,11 @@ unsafe extern "system" fn wndproc(
                         return LRESULT(0);
                     }
                     NM_CUSTOMDRAW => {
-                        let nm = unsafe { &*(lparam.0 as *const windows::Win32::UI::Controls::NMCUSTOMDRAW) };
-                        return on_list_custom_draw(st, nm);
+                        // Список присылает NMLVCUSTOMDRAW (расширение NMCUSTOMDRAW).
+                        return on_list_custom_draw(
+                            st,
+                            lparam.0 as *mut windows::Win32::UI::Controls::NMLVCUSTOMDRAW,
+                        );
                     }
                     windows::Win32::UI::Controls::LVN_ITEMCHANGED => {
                         let nm = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
@@ -624,6 +694,37 @@ unsafe extern "system" fn wndproc(
             }
             LRESULT(0)
         }
+        WM_ERASEBKGND => {
+            // Фон главного окна — палитра темы (TASK-N05): закрыть щели
+            // вокруг поля поиска и на ресайзе до переложения детей.
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            let p = theme::palette(st.dark);
+            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+            let mut rc = RECT::default();
+            if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
+                let br = unsafe { CreateSolidBrush(p.bg) };
+                unsafe { FillRect(hdc, &rc, br) };
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(br.0));
+                }
+            }
+            LRESULT(1)
+        }
+        WM_CTLCOLOREDIT => {
+            // Поле поиска (TASK-N05): фон и текст палитрой, кисть — из
+            // AppState (пересоздаётся в apply_theme).
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            if HWND(lparam.0 as *mut core::ffi::c_void) == st.hwnd_search {
+                let p = theme::palette(st.dark);
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                unsafe {
+                    let _ = SetTextColor(hdc, p.text);
+                    let _ = SetBkColor(hdc, p.surface);
+                }
+                return LRESULT(st.hbr_edit.0 as isize);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             unsafe {
@@ -668,16 +769,19 @@ fn run() -> Result<()> {
     }
     // Класс сплиттеров (TASK-N04).
     register_splitter_class(hmod)?;
+    // Класс статус-бара (TASK-N05: собственный, палитра темы).
+    register_status_class(hmod)?;
 
     // Состояние уходит в GWLP_USERDATA через CREATESTRUCTW (WM_NCCREATE).
     let state = Box::into_raw(Box::new(AppState::new(font, font_bold)));
-    // Веса панелей из %APPDATA%\Soroka\layout.json (TASK-N04); нет файла —
-    // дефолт как в Soroka (LAYOUT_DEFAULTS).
-    if let Some((wf, wl, wr)) = layout_store::load() {
+    // Веса панелей и тема из %APPDATA%\Soroka\layout.json (TASK-N04/N05);
+    // нет файла — дефолт как в Soroka (веса LAYOUT_DEFAULTS, тёмная тема).
+    if let Some((wf, wl, wr, dark)) = layout_store::load() {
         unsafe {
             (*state).wf = wf;
             (*state).wl = wl;
             (*state).wr = wr;
+            (*state).dark = dark;
         }
     }
     let hwnd = unsafe {
@@ -722,7 +826,7 @@ fn run() -> Result<()> {
         WC_LISTVIEW,
         WINDOW_STYLE(LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS),
     )?;
-    st.hwnd_status = child(STATUSBAR_CLASS, WINDOW_STYLE(0))?;
+    st.hwnd_status = child(STATUS_CLASS, WINDOW_STYLE(0))?;
 
     // Поле поиска (TASK-N03): скрытая строка над списком, появляется по «/».
     st.hwnd_search = unsafe {
@@ -802,7 +906,12 @@ fn run() -> Result<()> {
     // Шрифт интерфейса всем детям (системный, подобранный под DPI).
     for h in [st.hwnd_tree, st.hwnd_list, st.hwnd_status, st.hwnd_search] {
         unsafe {
-            SendMessageW(h, WM_SETFONT, Some(WPARAM(st.font.0 as usize)), Some(LPARAM(1)));
+            SendMessageW(
+                h,
+                WM_SETFONT,
+                Some(WPARAM(st.font.0 as usize)),
+                Some(LPARAM(1)),
+            );
         }
     }
 
@@ -829,6 +938,17 @@ fn run() -> Result<()> {
 
     // Меню + ускорители.
     let haccel = create_menu(hwnd)?;
+    // Галочка темы (TASK-N05): тёмная — как в Soroka — отмечена по умолчанию.
+    if st.dark {
+        let menu = unsafe { GetMenu(hwnd) };
+        if !menu.is_invalid() {
+            unsafe {
+                let _ = CheckMenuItem(menu, IDM_THEME as u32, MF_BYCOMMAND.0 | MF_CHECKED.0);
+            }
+        }
+    }
+    // Тема до показа окна — без вспышки системных цветов (TASK-N05).
+    apply_theme(st);
 
     // Панель письма: WebView2 (единственный движок в оболочке).
     let backend = Backend::spawn(hwnd);
@@ -836,7 +956,7 @@ fn run() -> Result<()> {
     st.controller = Some(controller);
     st.webview = Some(webview);
     if let Some(wv) = &st.webview {
-        let _ = unsafe { wv.NavigateToString(&HSTRING::from(empty_pane_html())) };
+        let _ = unsafe { wv.NavigateToString(&HSTRING::from(empty_pane_html(st.dark))) };
     }
     st.backend = Some(backend);
 
