@@ -88,7 +88,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO,
     WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT, WM_NOTIFY,
     WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC,
-    WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_COMPOSITED, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
@@ -1248,12 +1248,16 @@ fn run() -> Result<()> {
     }
     let hwnd = unsafe {
         CreateWindowExW(
-            // WS_EX_COMPOSITED: дети рисуются снизу вверх одним проходом —
-            // без него фон мелькает между перерисовками детей (TASK-N04).
-            WINDOW_EX_STYLE(WS_EX_COMPOSITED.0),
+            // WS_CLIPCHILDREN (TASK-N04.3): родитель никогда не рисует поверх
+            // детей — его стирание фона не мелькает сквозь панели между их
+            // перерисовками. WS_EX_COMPOSITED из v0.3.7 убран: с WebView2-
+            // ребёнком (ускоренная отрисовка вне WM_PAINT) композиция сама
+            // источник вспышек; от межоконных разрывов теперь WS_CLIPCHILDREN
+            // + двойная буферизация контролов (манифест comctl32 v6).
+            WINDOW_EX_STYLE(0),
             WINDOW_CLASS,
             w!("POS Mail — Фаза 1: почтовый каркас"),
-            WS_OVERLAPPEDWINDOW,
+            WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0),
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1440,
@@ -1322,6 +1326,8 @@ fn run() -> Result<()> {
         start_a_px: 0,
         sum_px: 0,
         sum_w: 0.0,
+        last_x: 0,
+        timer_armed: false,
     }));
     let ctx_split_pane = Box::into_raw(Box::new(SplitCtx {
         main: hwnd,
@@ -1333,6 +1339,8 @@ fn run() -> Result<()> {
         start_a_px: 0,
         sum_px: 0,
         sum_w: 0.0,
+        last_x: 0,
+        timer_armed: false,
     }));
     st.hwnd_split_tree = unsafe {
         CreateWindowExW(

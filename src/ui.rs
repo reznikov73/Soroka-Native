@@ -16,29 +16,29 @@ use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
     CDRF_NOTIFYSUBITEMDRAW, HTREEITEM, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH,
     LVCOLUMNW, LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
-    LVM_DELETECOLUMN, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_SETBKCOLOR, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMTREEVIEWW, TVE_EXPAND,
-    TVGN_CARET, TVHITTESTINFO, TVHT_ONITEM, TVI_LAST, TVI_ROOT, TVIF_HANDLE, TVIF_PARAM, TVIF_TEXT,
-    TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_GETITEMW,
-    TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
-    TVM_SETTEXTCOLOR, WM_MOUSELEAVE,
+    LVM_DELETECOLUMN, LVM_GETHEADER, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_SETBKCOLOR,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETTEXTBKCOLOR,
+    LVM_SETTEXTCOLOR, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, NMLISTVIEW, NMLVCUSTOMDRAW,
+    NMLVDISPINFOW, NMTREEVIEWW, SetWindowTheme, TVE_EXPAND, TVGN_CARET, TVHITTESTINFO, TVHT_ONITEM,
+    TVI_LAST, TVI_ROOT, TVIF_HANDLE, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0,
+    TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_GETITEMW, TVM_HITTEST, TVM_INSERTITEMW,
+    TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETLINECOLOR, TVM_SETTEXTCOLOR, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateAcceleratorTableW, CreateMenu,
-    CreatePopupMenu, DefWindowProcW, DestroyMenu, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY,
+    CreatePopupMenu, DefWindowProcW, DestroyMenu, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, GWL_STYLE,
     GWLP_USERDATA, GetClientRect, GetParent, GetSystemMetrics, GetWindowLongPtrW,
     GetWindowPlacement, GetWindowTextLengthW, GetWindowTextW, HACCEL, HMENU, IDC_ARROW, IDC_SIZEWE,
     KillTimer, LoadCursorW, MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW,
     PostMessageW, RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SendMessageW, SetMenu,
+    SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SendMessageW, SetMenu, SetTimer,
     SetWindowLongPtrW, SetWindowPlacement, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenuEx, WINDOWPLACEMENT, WM_CAPTURECHANGED, WM_COMMAND, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCPAINT, WM_NULL, WM_PAINT,
-    WM_SIZE, WNDCLASSW,
+    TrackPopupMenuEx, WINDOWPLACEMENT, WM_CAPTURECHANGED, WM_COMMAND, WM_ERASEBKGND,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCPAINT, WM_NULL,
+    WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW,
 };
 use windows::core::{Error, HSTRING, PCWSTR, w};
 
@@ -91,6 +91,10 @@ pub const EN_CHANGE: u32 = 0x0300;
 pub const IDT_SEARCH: usize = 1;
 /// Таймер автопроверки почты (TASK-N07): интервал — native_autosync_min.
 pub const IDT_AUTOSYNC: usize = 2;
+/// Таймер сглаживания drag сплиттера (TASK-N04.3): раскладку применяем
+/// не каждым движением мыши (до 1000 событий/с), а тиком ~66 Гц.
+/// 3 занят автосохранением черновика — оно в окне редактора (TASK-N08).
+pub const IDT_SPLIT_DRAG: usize = 4;
 /// EM_SETSEL (0x00B1) — выделение текста в EDIT.
 const EM_SETSEL: u32 = 0x00B1;
 
@@ -302,6 +306,11 @@ pub struct SplitCtx {
     pub start_a_px: i32,
     pub sum_px: i32,
     pub sum_w: f64,
+    /// Последний x мыши в жесте — применяется тиком сглаживания
+    /// (TASK-N04.3) и дожимается отпусканием.
+    pub last_x: i32,
+    /// Таймер сглаживания взведён.
+    pub timer_armed: bool,
 }
 
 const SPLITTER_CLASS: PCWSTR = w!("SorokaNativeSplitter");
@@ -339,6 +348,11 @@ unsafe extern "system" fn splitter_proc(
             let cs = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize) };
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_ERASEBKGND => {
+            // Весь клиент рисуем в WM_PAINT — отдельное стирание отдельным
+            // кадром и есть мерцание (TASK-N04.3).
+            LRESULT(1)
         }
         WM_PAINT => {
             let Some(ctx) = ctx else {
@@ -397,24 +411,26 @@ unsafe extern "system" fn splitter_proc(
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
             if ctx.captured {
-                // dx — клиентские координаты самой полосы: capture доставляет
-                // WM_MOUSEMOVE и за пределами окна, координаты остаются корректными.
-                let x = ((lparam.0 as usize) & 0xFFFF) as u16 as i16 as i32;
-                let st =
-                    unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
-                let pa =
-                    (ctx.start_a_px + (x - ctx.start_x)).clamp(PANE_MIN, ctx.sum_px - PANE_MIN);
-                let wa = ctx.sum_w * pa as f64 / ctx.sum_px as f64;
-                if ctx.pane {
-                    st.wl = wa;
-                    st.wr = ctx.sum_w - wa;
-                } else {
-                    st.wf = wa;
-                    st.wl = ctx.sum_w - wa;
+                // Клиентские координаты самой полосы: capture доставляет
+                // WM_MOUSEMOVE и за пределами окна, координаты корректны.
+                // Сглаживание (TASK-N04.3): запоминаем x и взводим таймер
+                // 15 мс — раскладку применяет тик, а не каждое движение.
+                ctx.last_x = ((lparam.0 as usize) & 0xFFFF) as u16 as i16 as i32;
+                if !ctx.timer_armed {
+                    ctx.timer_armed = true;
+                    let _ = unsafe { SetTimer(Some(hwnd), IDT_SPLIT_DRAG, 15, None) };
                 }
-                st.dragging = true;
-                let _ =
-                    unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == IDT_SPLIT_DRAG => {
+            // Тик сглаживания (TASK-N04.3): применяем веса по последнему x.
+            let _ = unsafe { KillTimer(Some(hwnd), IDT_SPLIT_DRAG) };
+            if let Some(ctx) = ctx {
+                ctx.timer_armed = false;
+                if ctx.captured {
+                    unsafe { apply_drag(ctx) };
+                }
             }
             LRESULT(0)
         }
@@ -433,6 +449,8 @@ unsafe extern "system" fn splitter_proc(
             unsafe { SetCapture(hwnd) };
             ctx.captured = true;
             ctx.start_x = ((lparam.0 as usize) & 0xFFFF) as u16 as i16 as i32;
+            // До первого движения применится «нулевой» сдвиг — веса не меняются.
+            ctx.last_x = ctx.start_x;
             let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
             if ctx.pane {
                 ctx.start_a_px = st.list_px;
@@ -459,6 +477,11 @@ unsafe extern "system" fn splitter_proc(
                 if msg == WM_LBUTTONUP {
                     let _ = unsafe { ReleaseCapture() };
                 }
+                // Дожать неприменённый тик сглаживания (TASK-N04.3):
+                // последний x мыши не должен теряться на отпускании.
+                let _ = unsafe { KillTimer(Some(hwnd), IDT_SPLIT_DRAG) };
+                ctx.timer_armed = false;
+                unsafe { apply_drag(ctx) };
                 let st =
                     unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
                 st.dragging = false;
@@ -496,6 +519,25 @@ unsafe extern "system" fn splitter_proc(
     }
 }
 
+/// Применить веса панелей по ctx.last_x и переложить детей (математика
+/// dragSplit из Soroka: сумма весов пары сохраняется, минимум панели
+/// 110px). Вызывается тиком сглаживания при drag и отпусканием мыши —
+/// не каждым WM_MOUSEMOVE (TASK-N04.3).
+unsafe fn apply_drag(ctx: &mut SplitCtx) {
+    let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
+    let pa = (ctx.start_a_px + (ctx.last_x - ctx.start_x)).clamp(PANE_MIN, ctx.sum_px - PANE_MIN);
+    let wa = ctx.sum_w * pa as f64 / ctx.sum_px as f64;
+    if ctx.pane {
+        st.wl = wa;
+        st.wr = ctx.sum_w - wa;
+    } else {
+        st.wf = wa;
+        st.wl = ctx.sum_w - wa;
+    }
+    st.dragging = true;
+    let _ = unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
+}
+
 // ===== Статус-бар (TASK-N05) =====
 
 /// Класс собственного статус-бара: msctls_statusbar32 не даёт задать цвет
@@ -528,6 +570,11 @@ unsafe extern "system" fn status_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_ERASEBKGND => {
+            // Весь клиент рисуем в WM_PAINT — без отдельного стирания
+            // (TASK-N04.3: erase отдельным кадром = мерцание).
+            LRESULT(1)
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
@@ -579,6 +626,20 @@ unsafe extern "system" fn status_proc(
 pub fn apply_theme(st: &mut AppState) {
     let p = theme::palette(st.dark);
     unsafe {
+        // Темы comctl32 v6 (манифест, TASK-N04.3): без явного subtheme шапка
+        // списка и скроллбары уходят в светлую тему даже в тёмной палитре —
+        // просим тёмный вариант (Win10 1809+; нет его — обычный).
+        let sub = if st.dark {
+            w!("DarkMode_Explorer")
+        } else {
+            w!("Explorer")
+        };
+        let _ = SetWindowTheme(st.hwnd_tree, sub, PCWSTR::null());
+        let _ = SetWindowTheme(st.hwnd_list, sub, PCWSTR::null());
+        let hdr = SendMessageW(st.hwnd_list, LVM_GETHEADER, Some(WPARAM(0)), None);
+        if hdr.0 != 0 {
+            let _ = SetWindowTheme(HWND(hdr.0 as *mut core::ffi::c_void), sub, PCWSTR::null());
+        }
         // Дерево: фон, текст, линии — TVM-сообщения (выделение остаётся
         // системным, как и у списка: контрол красит его сам).
         SendMessageW(
@@ -726,6 +787,16 @@ pub fn setup_list_columns(hwnd_list: HWND) {
                 (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize,
             )),
         );
+        // Шапка списка (SysHeader32): HDS_DOUBLEBUFFER (0x0001, comctl32
+        // v6) — без неё полоса шапки мерцает при каждом изменении ширины
+        // списка. Константы в windows-крейте нет — значение из commctrl.h.
+        const HDS_DOUBLEBUFFER: u32 = 0x0001;
+        let hdr = SendMessageW(hwnd_list, LVM_GETHEADER, Some(WPARAM(0)), None);
+        if hdr.0 != 0 {
+            let hdr = HWND(hdr.0 as *mut core::ffi::c_void);
+            let style = GetWindowLongPtrW(hdr, GWL_STYLE) as u32;
+            SetWindowLongPtrW(hdr, GWL_STYLE, (style | HDS_DOUBLEBUFFER) as isize);
+        }
     }
 }
 
