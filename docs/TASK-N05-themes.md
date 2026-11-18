@@ -104,6 +104,11 @@ ROADMAP N05: палитра Soroka (тёмная/светлая) для обол
   windows-gnu (тот же крейт windows 0.62 — сигнатуры идентичны);
   live-сборка `cargo build --release` + `cargo test` на Windows —
   за владельцем, как в v0.2.1/v0.3.1.
+- **Live MSVC-сборка на Windows выполнена (AutoClaw, машина владельца,
+  2026-11-18):** `cargo build --release` чисто, `cargo test` — 68 passed /
+  0 failed / 1 ignored (включая 8 тестов дат), `cargo clippy --all-targets
+  -- -D warnings` — чисто, правки кода не потребовались. Переключение темы
+  меню «Вид → Тёмная тема»: layout.json dark↔light, приложение стабильно.
 - Тесты дат запущены на Linux напрямую (модуль без Win32): 8 passed.
   Тесты layout_store (serde-логика) в отдельном crate: 3 passed.
 - rustfmt прогнан; форматирование `src/mail/`, `src/backend.rs`,
