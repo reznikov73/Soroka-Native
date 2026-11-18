@@ -10,13 +10,13 @@ use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow, EnableWindow,
+    BN_CLICKED, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
     ES_AUTOHSCROLL, ES_PASSWORD, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_ARROW,
     LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW, WM_COMMAND,
     WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WM_SIZE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, RegisterClassW,
 };
 
 use crate::backend::{Job, LoginOutcome, WM_APP_LOGIN_RESULT};
@@ -159,7 +159,11 @@ unsafe fn child(
             w,
             h,
             Some(parent),
-            None,
+            // ID контрола передаётся в hMenu дочернего окна — по нему WM_COMMAND
+            // и разбирает нажатия (IDC_EMAIL, IDC_IMAP_HOST и т.д.).
+            Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                id as isize as *mut std::ffi::c_void,
+            )),
             Some(windows::Win32::Foundation::HINSTANCE(hmod.0)),
             None,
         )
@@ -244,7 +248,7 @@ unsafe extern "system" fn wndproc(
                 return LRESULT(-1);
             };
             let hfont = unsafe { windows::Win32::Graphics::Gdi::GetStockObject(DEFAULT_GUI_FONT) };
-            let edit_style = WS_TABSTOP.0 | ES_AUTOHSCROLL.0;
+            let edit_style = WS_TABSTOP.0 | ES_AUTOHSCROLL as u32;
             unsafe {
                 let fields: [(&str, i32, i32, bool); 6] = [
                     ("Email:", 16, IDC_EMAIL, false),
@@ -268,7 +272,7 @@ unsafe extern "system" fn wndproc(
                     );
                     set_font(h, hfont);
                     let (class, style, text) = if is_pass {
-                        (w!("EDIT"), WS_TABSTOP.0 | ES_AUTOHSCROLL.0 | ES_PASSWORD.0, None)
+                        (w!("EDIT"), WS_TABSTOP.0 | ES_AUTOHSCROLL as u32 | ES_PASSWORD as u32, None)
                     } else {
                         (w!("EDIT"), edit_style, None)
                     };
@@ -342,7 +346,7 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_SIZE => {
-            if let Some(st) = (unsafe { st_of(hwnd) }) {
+            if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe { layout(hwnd, st) };
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -383,7 +387,7 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            if let Some(st) = (unsafe { st_of(hwnd) }) {
+            if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe {
                     windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                         Some(st.parent),

@@ -61,6 +61,11 @@ pub enum Job {
     },
 }
 
+// В `Job` лежат HWND (hwnd_reply) — настоящие ручки окон, а не указатели на
+// данные: PostMessageW/SendMessageW можно вызывать с ними из любого потока.
+// Других не-Send полей в `Job` нет, поэтому отправка задачи в рабочий поток безопасна.
+unsafe impl Send for Job {}
+
 /// Событие, доставляемое в UI-поток через общую очередь + PostMessage.
 pub enum MailEvent {
     /// Синхронизация папки завершилась (успешно или с ошибкой сети).
@@ -130,9 +135,15 @@ impl Backend {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let ev_for_thread = Arc::clone(&events);
+        // HWND (*mut c_void) не Send: передаём ручку числом и восстанавливаем
+        // в рабочем потоке. PostMessageW потокобезопасен.
+        let hwnd_raw = hwnd_main.0 as isize;
         std::thread::Builder::new()
             .name("mail-worker".into())
-            .spawn(move || worker_loop(rx, ev_for_thread, hwnd_main))
+            .spawn(move || {
+                let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+                worker_loop(rx, ev_for_thread, hwnd)
+            })
             .expect("запустить почтовый поток");
         Self { tx, events }
     }
@@ -577,7 +588,7 @@ fn send_mail(
                 match Store::open_default()
                     .and_then(|s| s.queue_outbox(&account.id, to, subject, &payload))
                 {
-                    Ok(()) => finish(SendOutcome {
+                    Ok(_) => finish(SendOutcome {
                         ok: true,
                         queued: true,
                         msg: "сети нет — письмо поставлено в очередь (уйдёт при следующей синхронизации)".into(),

@@ -10,18 +10,19 @@ use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{
+use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow, EnableWindow,
+    BN_CLICKED, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
     ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GWLP_USERDATA,
     GetClientRect, GetWindowLongPtrW, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT,
     LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, IDC_ARROW, MessageBoxW, WM_COMMAND,
     WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WM_SIZE, WINDOW_EX_STYLE, WINDOW_STYLE,
     WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    RegisterClassW,
 };
 
 use crate::backend::{Job, SendOutcome, WM_APP_SEND_RESULT};
@@ -194,7 +195,11 @@ unsafe fn child(
             w,
             h,
             Some(parent),
-            None,
+            // ID контрола передаётся в hMenu дочернего окна — по нему WM_COMMAND
+            // и разбирает нажатия (IDC_BTN_ATTACH, IDC_TO и т.д.).
+            Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                id as isize as *mut std::ffi::c_void,
+            )),
             Some(windows::Win32::Foundation::HINSTANCE(hmod.0)),
             None,
         )
@@ -323,7 +328,7 @@ unsafe extern "system" fn wndproc(
                     set_font(h, hfont);
                 }
                 // Поля.
-                let edit_style = WS_TABSTOP.0 | ES_AUTOHSCROLL.0;
+                let edit_style = WS_TABSTOP.0 | ES_AUTOHSCROLL as u32;
                 st.hwnd_to = child(hwnd, w!("EDIT"), None, edit_style, 102, 14, 400, 24, IDC_TO);
                 st.hwnd_cc = child(hwnd, w!("EDIT"), None, edit_style, 102, 46, 400, 24, IDC_CC);
                 st.hwnd_subject = child(
@@ -345,7 +350,7 @@ unsafe extern "system" fn wndproc(
                     hwnd,
                     w!("LISTBOX"),
                     None,
-                    LBS_NOTIFY.0 | WS_VSCROLL.0,
+                    LBS_NOTIFY as u32 | WS_VSCROLL.0,
                     12,
                     110,
                     400,
@@ -383,9 +388,9 @@ unsafe extern "system" fn wndproc(
                     w!("EDIT"),
                     None,
                     WS_TABSTOP.0
-                        | ES_MULTILINE.0
-                        | ES_WANTRETURN.0
-                        | ES_AUTOVSCROLL.0
+                        | ES_MULTILINE as u32
+                        | ES_WANTRETURN as u32
+                        | ES_AUTOVSCROLL as u32
                         | WS_VSCROLL.0,
                     12,
                     220,
@@ -436,7 +441,7 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_SIZE => {
-            if let Some(st) = (unsafe { st_of(hwnd) }) {
+            if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe { layout(hwnd, st) };
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -495,7 +500,7 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            if let Some(st) = (unsafe { st_of(hwnd) }) {
+            if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe {
                     windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                         Some(st.parent),
@@ -526,8 +531,8 @@ unsafe fn on_attach(hwnd: HWND) {
     let filter = wide("Все файлы\0*.*\0");
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: Some(hwnd),
-        lpstrFilter: filter.as_ptr(),
+        hwndOwner: hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
         lpstrFile: windows::core::PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
         Flags: OFN_ALLOWMULTISELECT

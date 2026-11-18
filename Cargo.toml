@@ -1,6 +1,6 @@
 [package]
 name = "posmail-native"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.90"
 description = "POS Mail — нативная оболочка Win32 на Rust. Фаза 1: почтовый каркас."
@@ -18,6 +18,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

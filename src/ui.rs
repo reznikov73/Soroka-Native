@@ -4,23 +4,24 @@
 //! Все функции вызываются только из UI-потока. Блокирующие операции уходят
 //! в `backend` (рабочий поток), сюда возвращаются события через WM_APP_MAIL.
 
-use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
 use windows::core::{HSTRING, PCWSTR, w};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateFontIndirectW, LOGFONTW, SelectObject, HFONT};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontIndirectW, InvalidateRect, LOGFONTW, SelectObject, HFONT, HGDIOBJ,
+};
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
     CDRF_NOTIFYSUBITEMDRAW, HTREEITEM, LVCOLUMNW, LVCF_TEXT, LVCF_WIDTH, LVM_INSERTCOLUMNW,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVS_EX_DOUBLEBUFFER,
     LVS_EX_FULLROWSELECT, LVIF_TEXT, NMCUSTOMDRAW, NMLISTVIEW, NMLVDISPINFOW,
-    NONCLIENTMETRICSW, NMTREEVIEWW, TVGN_CARET, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW,
+    NMTREEVIEWW, TVGN_CARET, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW,
     TVINSERTSTRUCTW_0, TVI_LAST, TVI_ROOT, TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW,
     TVM_SELECTITEM, TVE_EXPAND,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, InvalidateRect, MENU_ITEM_FLAGS, MF_POPUP,
+    AppendMenuW, CreateMenu, CreatePopupMenu, MENU_ITEM_FLAGS, MF_POPUP,
     MF_SEPARATOR, MF_STRING, SendMessageW, SetMenu, HACCEL, ACCEL, CreateAcceleratorTableW,
-    FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY,
+    FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, NONCLIENTMETRICSW,
 };
 
 use crate::backend::{BodyData, MailEvent};
@@ -85,7 +86,7 @@ pub fn create_fonts() -> (HFONT, HFONT) {
         let ok = windows::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
             windows::Win32::UI::WindowsAndMessaging::SPI_GETNONCLIENTMETRICS,
             metrics.cbSize,
-            &mut metrics as *mut NONCLIENTMETRICSW as *mut std::ffi::c_void,
+            Some(&mut metrics as *mut NONCLIENTMETRICSW as *mut std::ffi::c_void),
             windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         )
         .is_ok();
@@ -105,16 +106,14 @@ pub fn create_fonts() -> (HFONT, HFONT) {
 /// Меню + таблица ускорителей. Возвращает HACCEL для цикла сообщений.
 pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
     unsafe {
-        let bar = CreateMenu();
-        let mail = CreatePopupMenu();
-        let folder = CreatePopupMenu();
-        let accounts = CreatePopupMenu();
-        let file = CreatePopupMenu();
+        let bar = CreateMenu()?;
+        let mail = CreatePopupMenu()?;
+        let folder = CreatePopupMenu()?;
+        let accounts = CreatePopupMenu()?;
+        let file = CreatePopupMenu()?;
 
         let item = |menu, flags: MENU_ITEM_FLAGS, id: usize, text: PCWSTR| {
-            unsafe {
-                AppendMenuW(menu, flags, id, text).ok();
-            }
+            AppendMenuW(menu, flags, id, text).ok();
         };
 
         item(
@@ -156,7 +155,7 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
         item(bar, MF_POPUP, accounts.0 as usize, w!("&Ящики"));
         item(bar, MF_POPUP, file.0 as usize, w!("&Файл"));
 
-        SetMenu(hwnd, bar)?;
+        SetMenu(hwnd, Some(bar))?;
 
         let accels = [
             ACCEL {
@@ -245,7 +244,7 @@ unsafe fn tv_insert(tv: HWND, parent: HTREEITEM, text: &str, slot: usize) -> HTR
                 mask: TVIF_TEXT | TVIF_PARAM,
                 pszText: windows::core::PWSTR(buf.as_mut_ptr()),
                 cchTextMax: buf.len() as i32,
-                lParam: slot as isize,
+                lParam: LPARAM(slot as isize),
                 ..Default::default()
             },
         },
@@ -258,7 +257,7 @@ unsafe fn tv_insert(tv: HWND, parent: HTREEITEM, text: &str, slot: usize) -> HTR
             Some(LPARAM(&ins as *const TVINSERTSTRUCTW as isize)),
         )
     };
-    HTREEITEM(res.0 as *mut std::ffi::c_void)
+    HTREEITEM(res.0)
 }
 
 /// Человеческое имя папки для дерева.
@@ -359,7 +358,7 @@ pub fn rebuild_tree(hwnd_tv: HWND, st: &mut AppState) {
 
 /// Обработка TVN_SELCHANGEDW: выбор папки в дереве.
 pub fn on_tree_select(hwnd_list: HWND, st: &mut AppState, nm: &NMTREEVIEWW) {
-    let slot = nm.itemNew.lParam as usize;
+    let slot = nm.itemNew.lParam.0 as usize;
     let Some(TreeSlot::Folder { key, .. }) = st.tree_slots.get(slot).cloned() else {
         return;
     };
@@ -409,9 +408,9 @@ pub fn on_get_disp_info(st: &mut AppState, nm: &mut NMLVDISPINFOW) {
     let text = match nm.item.iSubItem {
         0 => {
             if row.has_attachments {
-                "+"
+                "+".to_string()
             } else {
-                ""
+                String::new()
             }
         }
         1 => row.from.clone(),
@@ -426,12 +425,12 @@ pub fn on_get_disp_info(st: &mut AppState, nm: &mut NMLVDISPINFOW) {
 pub fn on_list_custom_draw(st: &AppState, nm: &NMCUSTOMDRAW) -> LRESULT {
     match nm.dwDrawStage {
         CDDS_PREPAINT => LRESULT(CDRF_NOTIFYITEMDRAW as isize),
-        stage if stage & CDDS_ITEMPREPAINT != 0 => {
+        stage if stage.0 & CDDS_ITEMPREPAINT.0 != 0 => {
             let i = nm.dwItemSpec as usize;
             let bold = st.rows.get(i).is_some_and(|m| !m.seen);
             let hfont = if bold { st.font_bold } else { st.font };
             unsafe {
-                SelectObject(nm.hdc, hfont);
+                SelectObject(nm.hdc, HGDIOBJ(hfont.0));
             }
             LRESULT(CDRF_NOTIFYSUBITEMDRAW as isize)
         }
@@ -494,7 +493,7 @@ pub fn letter_html(hdr: &MessageHeader, body: &BodyData) -> String {
             .enumerate()
             .map(|(i, a)| {
                 format!(
-                    r#"<a href="#" onclick="window.chrome.webview.postMessage('attach:{i}');return false;">{}</a> ({})"#,
+                    r##"<a href="#" onclick="window.chrome.webview.postMessage('attach:{i}');return false;">{}</a> ({})"##,
                     escape_html(&a.name),
                     fmt_size(a.size)
                 )

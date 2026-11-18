@@ -26,8 +26,9 @@ mod wide;
 use std::sync::mpsc;
 
 use webview2_com::{
-    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-    CoreWebView2EnvironmentOptions, Microsoft::Web::WebView2::Win32::*, wait_with_pump,
+    CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler, WebMessageReceivedEventHandler,
+    Microsoft::Web::WebView2::Win32::*, wait_with_pump,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 use windows::Win32::Foundation::{
@@ -37,7 +38,8 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX,
+    InitCommonControlsEx,
     LVN_GETDISPINFOW, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NMHDR, NMLVDISPINFOW,
     NMLISTVIEW, NMTREEVIEWW, NM_CUSTOMDRAW, TVN_SELCHANGEDW, WC_LISTVIEW, WC_TREEVIEW,
 };
@@ -174,16 +176,16 @@ unsafe fn create_webview(parent: HWND) -> Result<(ICoreWebView2Controller, ICore
                         return Ok(());
                     };
                     let mut text = windows::core::PWSTR::null();
-                    unsafe { args.TryGetWebMessageAsString(&mut text)? };
+                    args.TryGetWebMessageAsString(&mut text)?;
                     if text.is_null() {
                         return Ok(());
                     }
                     // PWSTR → String вручную: не зависим от вспомогательных API.
                     let mut len = 0usize;
-                    while unsafe { *text.0.add(len) } != 0 {
+                    while *text.0.add(len) != 0 {
                         len += 1;
                     }
-                    let units = unsafe { std::slice::from_raw_parts(text.0, len) };
+                    let units = std::slice::from_raw_parts(text.0, len);
                     let msg = String::from_utf16_lossy(units);
                     if let Some(idx) = msg
                         .strip_prefix("attach:")
@@ -623,7 +625,7 @@ fn run() -> Result<()> {
             break;
         }
         unsafe {
-            if TranslateAcceleratorW(Some(hwnd), haccel, &mut msg) == 0 {
+            if TranslateAcceleratorW(hwnd, haccel, &msg) == 0 {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
