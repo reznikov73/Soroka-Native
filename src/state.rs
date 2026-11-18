@@ -1,8 +1,11 @@
 //! Состояние главного окна (живёт в GWLP_USERDATA, трогается только UI-потоком).
 
+use std::collections::HashMap;
+
 use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2, ICoreWebView2Controller};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{HBRUSH, HFONT};
+use windows::Win32::UI::WindowsAndMessaging::HICON;
 
 use crate::backend::Backend;
 use crate::mail::accounts::Account;
@@ -71,6 +74,32 @@ pub struct AppState {
     /// Открыто ли окно настроек (TASK-N09; одновременно — только одно).
     pub hwnd_settings: Option<HWND>,
 
+    // Трей и автопроверка (TASK-N07).
+    /// Иконка трея без непрочитанных (конверт Сороки).
+    pub hicon_tray: HICON,
+    /// Иконка трея с точкой непрочитанных (TASK-079).
+    pub hicon_tray_alert: HICON,
+    /// Иконка добавлена в область уведомлений (для TaskbarCreated).
+    pub tray_added: bool,
+    /// Общее число непрочитанных по всем ящикам (подпись/иконка трея).
+    pub unread_total: u32,
+    /// Снимки UID кэша INBOX перед синхронизацией — для «новых писем»
+    /// (ключ → UIDs). Снимок пустого кэша не кладём: первая проверка
+    /// нового ящика — базлайн без уведомления.
+    pub autosync_known: HashMap<String, Vec<u32>>,
+    /// Подсказку «свёрнут в трей» показали (раз за запуск; Сорока
+    /// показывает её при каждом сворачивании, balloon у нас заметнее).
+    pub hide_hint_shown: bool,
+    /// Сообщение TaskbarCreated (возврат иконки после рестарта Explorer).
+    pub taskbar_created: u32,
+    /// Кнопка «—» и крестик прячут окно в трей — ui.minimize_to_tray
+    /// Soroka (кэш native_view, обновляется при сохранении настроек).
+    pub minimize_to_tray: bool,
+    /// Уведомления Windows о новых письмах — ui.notifications Soroka.
+    pub notifications: bool,
+    /// Интервал автопроверки, минут (0 — не проверять) — native_autosync_min.
+    pub autosync_min: u32,
+
     // Дочерние окна и панель WebView2.
     pub hwnd_tree: HWND,
     pub hwnd_list: HWND,
@@ -119,6 +148,16 @@ impl AppState {
             hwnd_compose: None,
             hwnd_account: None,
             hwnd_settings: None,
+            hicon_tray: HICON::default(),
+            hicon_tray_alert: HICON::default(),
+            tray_added: false,
+            unread_total: 0,
+            autosync_known: HashMap::new(),
+            hide_hint_shown: false,
+            taskbar_created: 0,
+            minimize_to_tray: true,
+            notifications: true,
+            autosync_min: 0,
             hwnd_tree: HWND::default(),
             hwnd_list: HWND::default(),
             hwnd_status: HWND::default(),

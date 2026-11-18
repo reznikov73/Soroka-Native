@@ -16,9 +16,11 @@
 
 mod account_dlg;
 mod ai;
+mod autostart;
 mod backend;
 mod compose;
 mod dates;
+mod ico;
 mod layout_store;
 // Настройки — дословный порт settings.rs Soroka (TASK-020/030/040/068...):
 // большая часть API (категории, промпты, подписи) понадобится в Фазе 3
@@ -26,6 +28,10 @@ mod layout_store;
 #[allow(dead_code)]
 mod settings;
 mod settings_dlg;
+// Трей и автопроверка (TASK-N07): notify/ico — чистая логика текстов и
+// разбора .ico (тестируется на Linux), tray — Win32-обвязка Shell_NotifyIconW.
+mod notify;
+mod tray;
 // Ядро Soroka перенесено дословно (правило WORKFLOW: src/mail/ не редактировать).
 // Часть его API (контакты, IDLE, пресеты провайдеров) подключается в Фазах 2–3 —
 // до тех пор dead_code на модуле неинформативен. Снять allow вместе с подключением
@@ -64,33 +70,40 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CallWindowProcW, CheckMenuItem,
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, GA_ROOT,
-    GWLP_USERDATA, GWLP_WNDPROC, GetAncestor, GetClientRect, GetMenu, GetMessageW, GetParent,
-    GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_BYCOMMAND,
-    MF_CHECKED, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOZORDER, SendMessageW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateAcceleratorW, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE, WM_TIMER,
-    WNDCLASSW, WNDPROC, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL,
+    GA_ROOT, GWLP_USERDATA, GWLP_WNDPROC, GetAncestor, GetClientRect, GetForegroundWindow, GetMenu,
+    GetMessageW, GetParent, GetWindowLongPtrW, IDC_ARROW, IsIconic, IsWindowVisible, KillTimer,
+    LoadCursorW, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_BYCOMMAND, MF_CHECKED, MF_UNCHECKED,
+    MINMAXINFO, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED,
+    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR,
+    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NOTIFY, WM_PAINT,
+    WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
 use account_dlg::{WM_APP_ACCOUNT_CLOSED, WM_APP_ACCOUNT_SAVED};
-use backend::{Backend, BodyData, Job, WM_APP_MAIL, WM_APP_SEND_RESULT};
+use backend::{Backend, BodyData, Job, MailEvent, WM_APP_MAIL, WM_APP_SEND_RESULT};
 use compose::{ComposePrefill, WM_APP_COMPOSE_CLOSED};
+use mail::store::Store;
 use settings_dlg::{WM_APP_SETTINGS_CLOSED, WM_APP_SETTINGS_SAVED};
 use state::AppState;
+use tray::WM_APP_TRAY;
 use ui::{
     EN_CHANGE, IDM_ACCOUNT_ADD, IDM_COMPOSE, IDM_DELETE, IDM_EXIT, IDM_FORWARD, IDM_REPLY,
     IDM_REPLY_ALL, IDM_SEARCH_CLOSE, IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SETTINGS, IDM_SYNC,
-    IDM_THEME, IDM_TOGGLE_SEEN, IDT_SEARCH, PANE_MIN, SEARCH_H, SPLIT_W, STATUS_CLASS, STATUS_H,
-    SplitCtx, apply_mail_event, apply_theme, create_fonts, create_menu, empty_pane_html,
-    enter_search, exit_search, fire_search, letter_html, on_get_disp_info, on_list_custom_draw,
-    on_list_item_changed, on_tree_select, rebuild_tree, register_splitter_class,
-    register_status_class, restore_placement, setup_list_columns, snapshot_placement, status_text,
+    IDM_THEME, IDM_TOGGLE_SEEN, IDM_TRAY_OPEN, IDT_AUTOSYNC, IDT_SEARCH, PANE_MIN, SEARCH_H,
+    SPLIT_W, STATUS_CLASS, STATUS_H, SplitCtx, apply_mail_event, apply_theme, create_fonts,
+    create_menu, empty_pane_html, enter_search, exit_search, fire_search, letter_html,
+    on_get_disp_info, on_list_custom_draw, on_list_item_changed, on_tree_select, rebuild_tree,
+    register_splitter_class, register_status_class, restore_placement, setup_list_columns,
+    snapshot_placement, status_text,
 };
 
 const WINDOW_CLASS: PCWSTR = w!("SorokaNativeWnd");
@@ -470,6 +483,123 @@ unsafe fn set_theme(hwnd: HWND, st: &mut AppState, dark: bool) {
     settings::store_theme(dark);
 }
 
+/// Показать главное окно из трея (клик/меню/balloon): восстановить из
+/// свёрнутого, поднять на передний план (TASK-N07).
+unsafe fn show_main(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Пересчитать общее число непрочитанных по всем ящикам из кэша и
+/// обновить подпись/иконку трея (порт set_tray_unread; чтение кэша —
+/// как в rebuild_tree, малый запрос).
+fn refresh_unread(hwnd: HWND, st: &mut AppState) {
+    let mut total = 0u32;
+    if let Ok(store) = Store::open_default() {
+        for acc in &st.accounts {
+            let like = format!("{}::%", acc.id);
+            if let Ok(rows) = store.unread_counts(&like) {
+                total += rows.iter().map(|&(_, u)| u).sum::<u32>();
+            }
+        }
+    }
+    st.unread_total = total;
+    tray::refresh(hwnd, st);
+}
+
+/// Перевооружить таймер автопроверки под st.autosync_min (0 — выключить).
+fn arm_autosync(hwnd: HWND, st: &AppState) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), IDT_AUTOSYNC);
+        if st.autosync_min > 0 {
+            // Минимум 1 минута: 0 исключён выше, дробных минут не бывает.
+            let _ = SetTimer(Some(hwnd), IDT_AUTOSYNC, st.autosync_min * 60_000, None);
+        }
+    }
+}
+
+/// Снимок UID кэша INBOX перед синхронизацией — для «новых писем»
+/// (TASK-N07). Пустой кэш не снимаем: первая проверка ящика — базлайн,
+/// без уведомления (иначе после добавления ящика балон показал бы всю
+/// историю папки). Не-INBOX не снимаем: уведомления — только о входящих,
+/// как sync_inbox в Soroka.
+fn snapshot_inbox(st: &mut AppState, key: &str) {
+    if !key.ends_with("::INBOX") {
+        return;
+    }
+    let known: Vec<u32> = Store::open_default()
+        .ok()
+        .and_then(|s| s.load_folder(key).ok())
+        .map(|v| v.iter().map(|m| m.uid).collect())
+        .unwrap_or_default();
+    if !known.is_empty() {
+        st.autosync_known.insert(key.to_string(), known);
+    }
+}
+
+/// Автопроверка по таймеру (TASK-N07): синхронизируем INBOX каждого
+/// ящика (у Soroka — таймеры по каждому ящику, интервал у нас общий —
+/// native_autosync_min). Задачи уходят в очередь рабочего потока;
+/// снимки UID — для уведомлений о новых письмах.
+fn trigger_autosync(st: &mut AppState) {
+    if st.accounts.is_empty() {
+        return;
+    }
+    // Ключи собираем заранее: дальше st меняется (снимки, статус).
+    let keys: Vec<String> = st
+        .accounts
+        .iter()
+        .map(|acc| format!("{}::INBOX", acc.id))
+        .collect();
+    for key in keys {
+        snapshot_inbox(st, &key);
+        if let Some(b) = &st.backend {
+            b.post(Job::SyncFolder { key });
+        }
+    }
+    status_text(st, "автопроверка почты...");
+}
+
+/// Проверить «новые письма» после SyncDone (TASK-N07): сравниваем свежий
+/// кэш со снимком до синхронизации. Уведомление — balloon трея — только
+/// когда включены ui.notifications и окно не на виду (порт notify_new_mail,
+/// TASK-087/099; вместо «загружено N» — честное число новых UID).
+fn check_new_mail(hwnd: HWND, st: &mut AppState, key: &str) {
+    let Some(known) = st.autosync_known.remove(key) else {
+        return;
+    };
+    let fresh = Store::open_default()
+        .ok()
+        .and_then(|s| s.load_folder(key).ok())
+        .unwrap_or_default();
+    let fresh_uids: Vec<u32> = fresh.iter().map(|m| m.uid).collect();
+    let n = notify::new_count(&known, &fresh_uids);
+    if n == 0 || !st.notifications {
+        return;
+    }
+    // Окно на виду — не шумим (как в Soroka: is_visible && is_focused).
+    let at_hand =
+        unsafe { IsWindowVisible(hwnd).as_bool() } && unsafe { GetForegroundWindow() } == hwnd;
+    if at_hand {
+        return;
+    }
+    let first = fresh
+        .iter()
+        .find(|m| !known.contains(&m.uid))
+        .map(|m| (m.from.as_str(), m.subject.as_str()));
+    tray::balloon(
+        hwnd,
+        &notify::new_mail_title(n),
+        &notify::new_mail_body(first),
+    );
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_NCCREATE => {
@@ -487,7 +617,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_SIZE => {
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             unsafe { layout(hwnd, st) };
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            let res = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            // Кнопка «—» — в трей, если так велит ui.minimize_to_tray
+            // (TASK-N07; в Soroka то же делает обработчик #win-min).
+            if wparam.0 == SIZE_MINIMIZED as usize && st.minimize_to_tray {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                };
+            }
+            res
+        }
+        WM_CLOSE => {
+            // Крестик — как в Soroka TASK-072: при включённом сворачивании
+            // в трей прячет окно, а не завершает программу (выход — меню
+            // трея); подсказку показываем один раз за запуск.
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            if st.minimize_to_tray {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                };
+                if !st.hide_hint_shown {
+                    st.hide_hint_shown = true;
+                    tray::balloon(
+                        hwnd,
+                        "POS Mail",
+                        "POS Mail свёрнут в трей. Выход — в меню трея.",
+                    );
+                }
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         WM_COMMAND => {
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
@@ -544,6 +704,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 IDM_SYNC => {
                     if let Some(key) = st.current_folder.clone() {
+                        // Снимок UID до синхронизации: F5 из главного окна и
+                        // «Проверить почту» из трея одинаково участвуют в
+                        // уведомлениях о новых письмах (TASK-N07).
+                        snapshot_inbox(st, &key);
                         status_text(st, "синхронизация...");
                         if let Some(b) = &st.backend {
                             b.post(Job::SyncFolder { key });
@@ -551,6 +715,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     } else {
                         status_text(st, "сначала выберите папку");
                     }
+                }
+                IDM_TRAY_OPEN => {
+                    // Меню трея: Открыть POS Mail (TASK-N07).
+                    unsafe { show_main(hwnd) };
                 }
                 IDM_COMPOSE => {
                     if st.accounts.is_empty() {
@@ -666,9 +834,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_MAIL => {
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             if let Some(b) = &st.backend {
+                let mut tray_dirty = false;
                 for ev in b.drain() {
+                    // События, меняющие непрочитанные: после них — счётчик
+                    // трея (TASK-N07). Проверку «новых» делаем до apply:
+                    // кэш бэкенд уже обновил, порядок UI-списка неважен.
+                    if matches!(
+                        ev,
+                        MailEvent::SyncDone { .. }
+                            | MailEvent::Seen { .. }
+                            | MailEvent::Unseen { .. }
+                            | MailEvent::Deleted { .. }
+                    ) {
+                        tray_dirty = true;
+                    }
+                    let sync_key = if let MailEvent::SyncDone {
+                        key, error: None, ..
+                    } = &ev
+                    {
+                        Some(key.clone())
+                    } else {
+                        None
+                    };
                     apply_mail_event(hwnd, st.hwnd_list, st.hwnd_tree, st, ev);
+                    if let Some(key) = sync_key {
+                        check_new_mail(hwnd, st, &key);
+                    }
                 }
+                if tray_dirty {
+                    refresh_unread(hwnd, st);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_TRAY => {
+            // События иконки трея (TASK-N07): lparam — сообщение мыши или
+            // клик по balloon. Левая кнопка и клик по уведомлению —
+            // показать окно; правая/контекстное меню — меню трея.
+            let ev = lparam.0 as u32;
+            if ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK || ev == NIN_BALLOONUSERCLICK {
+                unsafe { show_main(hwnd) };
+            } else if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU {
+                tray::track_menu(hwnd);
             }
             LRESULT(0)
         }
@@ -695,16 +902,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_ACCOUNT_SAVED => {
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             rebuild_tree(st.hwnd_tree, st);
+            // Ящик добавился/удалился — счётчик непрочитанных трея тоже.
+            refresh_unread(hwnd, st);
             LRESULT(0)
         }
         WM_APP_SETTINGS_SAVED => {
             // Диалог настроек сохранил файл (TASK-N09): перечитываем свои
             // ключи; тема могла измениться — применяем как «Вид → Тёмная тема».
+            // N07: трейные ключи — в кэш стейта, таймер и автозапуск —
+            // перевооружить.
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             let view = settings::native_view();
             if view.dark != st.dark {
                 unsafe { set_theme(hwnd, st, view.dark) };
             }
+            st.minimize_to_tray = view.minimize_to_tray;
+            st.notifications = view.notifications;
+            st.autosync_min = view.autosync_min;
+            arm_autosync(hwnd, st);
+            autostart::apply(view.autostart);
             status_text(st, "настройки сохранены (settings.json общий с Soroka)");
             LRESULT(0)
         }
@@ -729,6 +945,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 fire_search(hwnd, st.hwnd_list, st);
                 unsafe { layout(hwnd, st) };
             }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == IDT_AUTOSYNC => {
+            // Автопроверка (TASK-N07): интервал — native_autosync_min из
+            // общего settings.json; работает и со скрытым окном (таймер
+            // окна живёт, пока жив цикл сообщений).
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            trigger_autosync(st);
             LRESULT(0)
         }
         WM_ERASEBKGND => {
@@ -771,13 +995,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
+            // Трей: убрать иконку до уничтожения окна (TASK-N07), таймер
+            // гасится вместе с окном, HICON — наши, освобождаем сами.
+            {
+                let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+                tray::remove(hwnd, st);
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), IDT_AUTOSYNC);
+                    if !st.hicon_tray.is_invalid() {
+                        let _ = DestroyIcon(st.hicon_tray);
+                    }
+                    if !st.hicon_tray_alert.is_invalid() {
+                        let _ = DestroyIcon(st.hicon_tray_alert);
+                    }
+                }
+            }
             // Геометрия главного окна — в layout.json (TASK-N06), до
             // PostQuitMessage: дальше цикл сообщений завершится.
             layout_store::store_window(layout_store::WinKind::Main, snapshot_placement(hwnd));
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => {
+            // TaskbarCreated (TASK-N07): Explorer перезапустился — иконку
+            // трея нужно добавить заново (иначе она пропадает).
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            if st.taskbar_created != 0 && msg == st.taskbar_created {
+                tray::readd(hwnd, st);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
     }
 }
 
@@ -801,6 +1048,9 @@ fn run() -> Result<()> {
         lpfnWndProc: Some(wndproc),
         hInstance: windows::Win32::Foundation::HINSTANCE(hmod.0),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
+        // Иконка окна/панели задач — app.ico Сороки (TASK-N07; ранее
+        // оставалась системная заглушка).
+        hIcon: tray::load_app_icon().unwrap_or_default(),
         lpszClassName: WINDOW_CLASS,
         ..Default::default()
     };
@@ -829,9 +1079,14 @@ fn run() -> Result<()> {
     }
     // Тема — в общем settings.json (native_theme, TASK-N09). Из layout.json
     // (там её хранил N05) переносится одноразово; нет нигде — тёмная,
-    // как в Soroka.
+    // как в Soroka. Здесь же — кэш трейных ключей (TASK-N07): свернуть в
+    // трей, уведомления, интервал автопроверки.
+    let native_view = settings::native_view();
     unsafe {
         (*state).dark = settings::init_theme(layout_cfg.as_ref().and_then(|l| l.theme.as_deref()));
+        (*state).minimize_to_tray = native_view.minimize_to_tray;
+        (*state).notifications = native_view.notifications;
+        (*state).autosync_min = native_view.autosync_min;
     }
     let hwnd = unsafe {
         CreateWindowExW(
@@ -1009,8 +1264,16 @@ fn run() -> Result<()> {
     }
     st.backend = Some(backend);
 
+    // Трей (TASK-N07): иконки Сороки (конверт/конверт с точкой), добавить
+    // до показа окна; TaskbarCreated — для возврата после рестарта Explorer.
+    tray::load_tray_icons(st);
+    tray::add(hwnd, st);
+    st.taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+
     // Дерево ящиков/папок + выбор первого INBOX (загрузка из кэша — мгновенно).
     rebuild_tree(st.hwnd_tree, st);
+    // Подпись/иконка трея по непрочитанным из кэша (TASK-N07).
+    refresh_unread(hwnd, st);
     if st.accounts.is_empty() {
         status_text(
             st,
@@ -1034,6 +1297,11 @@ fn run() -> Result<()> {
         let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
         let _ = SetFocus(Some(st.hwnd_list));
     }
+
+    // Автопроверка (TASK-N07): таймер по native_autosync_min (0 — выкл.),
+    // автозапуск — синхронизировать с ui.autostart (реестр, HKCU Run).
+    arm_autosync(hwnd, st);
+    autostart::apply(native_view.autostart);
 
     // Цикл сообщений. Ускорители — только когда фокус в главном окне:
     // в поле поиска «/» и буквы должны печататься, в окнах редактора — свои

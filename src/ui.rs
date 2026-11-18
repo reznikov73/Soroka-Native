@@ -76,12 +76,17 @@ pub const IDM_SEARCH_GO: u16 = 131;
 pub const IDM_SEARCH_CLOSE: u16 = 132;
 pub const IDM_THEME: u16 = 133;
 pub const IDM_SETTINGS: u16 = 134;
+/// Открыть окно из трея (TASK-N07): команда из меню трея, пункта в
+/// главном меню нет.
+pub const IDM_TRAY_OPEN: u16 = 140;
 
 /// EN_CHANGE — уведомление EDIT о вводе (приходит через WM_COMMAND).
 /// В windows-rs константа лежит в WindowsAndMessaging — локальный псевдоним надёжен.
 pub const EN_CHANGE: u32 = 0x0300;
 /// Идентификатор таймера живого поиска (debounce 300 мс, как в Soroka).
 pub const IDT_SEARCH: usize = 1;
+/// Таймер автопроверки почты (TASK-N07): интервал — native_autosync_min.
+pub const IDT_AUTOSYNC: usize = 2;
 /// EM_SETSEL (0x00B1) — выделение текста в EDIT.
 const EM_SETSEL: u32 = 0x00B1;
 
