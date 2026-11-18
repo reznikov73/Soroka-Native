@@ -97,7 +97,7 @@ use backend::{
     Backend, BodyData, DraftSaved, Job, MailEvent, WM_APP_DRAFT_SAVED, WM_APP_MAIL,
     WM_APP_SEND_RESULT,
 };
-use compose::{ComposePrefill, WM_APP_COMPOSE_CLOSED};
+use compose::{ComposePrefill, WM_APP_COMPOSE_CLOSED, WM_APP_COMPOSE_THEME};
 use mail::store::Store;
 use settings_dlg::{WM_APP_SETTINGS_CLOSED, WM_APP_SETTINGS_SAVED};
 use state::AppState;
@@ -580,6 +580,18 @@ unsafe fn set_theme(hwnd: HWND, st: &mut AppState, dark: bool) {
     };
     if let Some(wv) = &st.webview {
         let _ = unsafe { wv.NavigateToString(&HSTRING::from(html)) };
+    }
+    // Открытый редактор перекрашивается тоже (фикс v0.3.11): фон, поля и
+    // список вложений — палитрой, как в главном окне.
+    if let Some(h) = st.hwnd_compose {
+        let _ = unsafe {
+            PostMessageW(
+                Some(h),
+                WM_APP_COMPOSE_THEME,
+                WPARAM(st.dark as usize),
+                LPARAM(0),
+            )
+        };
     }
     // Тема — в общем settings.json (TASK-N09): только свой ключ,
     // остальное содержимое файла не трогаем.

@@ -6,32 +6,43 @@
 
 use std::sync::mpsc::Sender;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, HGDIOBJ};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateSolidBrush, DEFAULT_GUI_FONT, DeleteObject, FillRect, HBRUSH, HDC, HGDIOBJ,
+    InvalidateRect, SetBkColor, SetTextColor,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
+use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL,
+    BeginDeferWindowPos, BN_CLICKED, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
+    DefWindowProcW, DeferWindowPos, DestroyWindow, EndDeferWindowPos, ES_AUTOHSCROLL,
     ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW,
-    IDC_ARROW, KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LBS_NOTIFY, LoadCursorW,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_YESNO, MessageBoxW, RegisterClassW, SetTimer,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
-    WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    IDC_ARROW, KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LBS_NOTIFY,
+    LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_YESNO, MessageBoxW, MINMAXINFO,
+    RegisterClassW, SetTimer, SWP_NOZORDER, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_NCCREATE, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::backend::{DraftSaved, Job, SendOutcome, WM_APP_DRAFT_SAVED, WM_APP_SEND_RESULT};
 use crate::mail::smtp::OutgoingAttachment;
 use crate::state::AppState;
+use crate::theme;
 use crate::wide::{read_text, set_window_text, wide};
 
 /// Главное окно узнаёт о закрытии редактора.
 pub const WM_APP_COMPOSE_CLOSED: u32 = crate::backend::WM_APP_LOGIN_RESULT + 1;
+
+/// Главное окно сообщает открытому редактору о смене темы (фикс v0.3.11):
+/// wparam != 0 — тёмная.
+pub const WM_APP_COMPOSE_THEME: u32 = WM_APP_COMPOSE_CLOSED + 1;
 
 const WINDOW_CLASS: PCWSTR = w!("SorokaComposeWnd");
 
@@ -90,6 +101,12 @@ struct ComposeState {
     last_print: String,
     /// Окно закрывается и ждёт результата сохранения черновика.
     closing_saving: bool,
+    /// Тема редактора (фикс v0.3.11): фон/поля/список красятся палитрой,
+    /// окно больше не белое пятно в тёмной теме. Кисти — в стейте:
+    /// WM_CTLCOLOREDIT/LISTBOX/STATIC приходят на каждую перерисовку.
+    dark: bool,
+    hbr_bg: HBRUSH,
+    hbr_surface: HBRUSH,
 }
 
 /// Открывает редактор (один на приложение). Возвращает HWND нового окна.
@@ -120,6 +137,10 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
 
     let hmod = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
     let wc = WNDCLASSW {
+        // CS_HREDRAW/CS_VREDRAW — как у главного окна (фикс v0.3.11):
+        // ресайз перекрашивает клиент целиком, обнажившиеся края не
+        // остаются «призраками» (стирание — в WM_ERASEBKGND ниже).
+        style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(wndproc),
         hInstance: windows::Win32::Foundation::HINSTANCE(hmod.0),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.expect("LoadCursorW"),
@@ -147,6 +168,9 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
         draft_saved: settled,
         last_print: String::new(),
         closing_saving: false,
+        dark: st.dark,
+        hbr_bg: HBRUSH::default(),
+        hbr_surface: HBRUSH::default(),
     });
     let raw = Box::into_raw(state);
 
@@ -155,7 +179,9 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
             WINDOW_EX_STYLE(0),
             WINDOW_CLASS,
             w!("Написать письмо — POS Mail"),
-            WS_OVERLAPPEDWINDOW,
+            // WS_CLIPCHILDREN (фикс v0.3.11, как в главном окне v0.3.10):
+            // фон окна не рисуется поверх контролов при переложении.
+            WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0),
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             780,
@@ -308,22 +334,77 @@ unsafe fn layout(hwnd: HWND, st: &ComposeState) {
     let body_y = btn_y + 38;
     let bottom_h = 48;
 
-    unsafe {
-        move_window(st.hwnd_to, field_x, 14, field_w, 24);
-        move_window(st.hwnd_cc, field_x, 46, field_w, 24);
-        move_window(st.hwnd_subject, field_x, 78, field_w, 24);
-        move_window(st.hwnd_attach_list, m, list_y, w - 2 * m, list_h);
-        move_window(
+    // Один DeferWindowPos-батч на все девять подвижных детей (фикс v0.3.11,
+    // паттерн главного окна v0.3.7): одна перерисовка вместо девяти
+    // отдельных SetWindowPos — при ресайзе окно не мерцает.
+    let entries: [(HWND, i32, i32, i32, i32); 9] = [
+        (st.hwnd_to, field_x, 14, field_w, 24),
+        (st.hwnd_cc, field_x, 46, field_w, 24),
+        (st.hwnd_subject, field_x, 78, field_w, 24),
+        (st.hwnd_attach_list, m, list_y, w - 2 * m, list_h),
+        (
             st.hwnd_body,
             m,
             body_y,
             w - 2 * m,
             (h - body_y - bottom_h).max(60),
-        );
-        move_window(st.hwnd_btn_send, w - m - 130, h - 38, 130, 30);
-        move_window(st.hwnd_btn_cancel, w - m - 250, h - 38, 110, 30);
-        move_window(st.hwnd_btn_draft, w - m - 370, h - 38, 110, 30);
-        move_window(st.hwnd_status, m, h - 30, (w - 2 * m - 390).max(120), 24);
+        ),
+        (st.hwnd_btn_send, w - m - 130, h - 38, 130, 30),
+        (st.hwnd_btn_cancel, w - m - 250, h - 38, 110, 30),
+        (st.hwnd_btn_draft, w - m - 370, h - 38, 110, 30),
+        (st.hwnd_status, m, h - 30, (w - 2 * m - 390).max(120), 24),
+    ];
+    unsafe {
+        match BeginDeferWindowPos(entries.len() as i32) {
+            Ok(mut wpos) => {
+                for (h2, x, y, cx, cy) in &entries {
+                    wpos =
+                        DeferWindowPos(wpos, *h2, None, *x, *y, *cx, *cy, SWP_NOZORDER)
+                            .unwrap_or(wpos);
+                }
+                let _ = EndDeferWindowPos(wpos);
+            }
+            Err(_) => {
+                // Резервный путь (практически недостижим): по одному.
+                for (h2, x, y, cx, cy) in &entries {
+                    move_window(*h2, *x, *y, *cx, *cy);
+                }
+            }
+        }
+    }
+}
+
+/// Палитра темы на редакторе (фикс v0.3.11): кисти фона/полей — в стейт,
+/// subtheme DarkMode_Explorer у полей и списка вложений (тёмные скроллбары,
+/// Win10 1809+; паттерн apply_theme главного окна). Кнопки — системная
+/// окраска (owner-draw кнопок вне объёма фикса, как и рамка поиска в N05).
+/// Вызывается при создании окна и при смене темы из главного окна.
+unsafe fn apply_theme(hwnd: HWND, st: &mut ComposeState) {
+    let p = theme::palette(st.dark);
+    unsafe {
+        if !st.hbr_bg.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(st.hbr_bg.0));
+        }
+        if !st.hbr_surface.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(st.hbr_surface.0));
+        }
+        st.hbr_bg = CreateSolidBrush(p.bg);
+        st.hbr_surface = CreateSolidBrush(p.surface);
+        let sub = if st.dark {
+            w!("DarkMode_Explorer")
+        } else {
+            w!("Explorer")
+        };
+        for h in [
+            st.hwnd_to,
+            st.hwnd_cc,
+            st.hwnd_subject,
+            st.hwnd_body,
+            st.hwnd_attach_list,
+        ] {
+            let _ = SetWindowTheme(h, sub, PCWSTR::null());
+        }
+        let _ = InvalidateRect(Some(hwnd), None, true);
     }
 }
 
@@ -477,15 +558,68 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 set_font(st.hwnd_status, hfont);
                 layout(hwnd, st);
+                apply_theme(hwnd, st);
             }
             // Автосохранение черновика каждые 20 с, пока окно открыто
             // (порт startDraftAutosave TASK-022; таймер живёт в этом окне).
             let _ = unsafe { SetTimer(Some(hwnd), IDT_DRAFT_AUTOSAVE, 20_000, None) };
             LRESULT(0)
         }
+        WM_GETMINMAXINFO => {
+            // Минимальный размер окна (фикс v0.3.11, как у главного окна):
+            // ниже редактор «ломается» — кнопки и поля наезжают друг на
+            // друга, список вложений съедает тело письма.
+            let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+            mmi.ptMinTrackSize = POINT { x: 560, y: 480 };
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => {
+            // Фон окна — палитра темы (фикс v0.3.11): обнажившееся при
+            // ресайзе закрашивается сразу — нет «призраков» и мусора,
+            // и окно больше не белое пятно в тёмной теме.
+            if let Some(st) = unsafe { st_of(hwnd) }
+                && !st.hbr_bg.is_invalid()
+            {
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                let mut rc = RECT::default();
+                if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
+                    unsafe { FillRect(hdc, &rc, st.hbr_bg) };
+                }
+            }
+            LRESULT(1)
+        }
         WM_SIZE => {
             if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe { layout(hwnd, st) };
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            // Поля (Кому/Копия/Тема/тело) и список вложений — палитра
+            // (фикс v0.3.11): текст на поверхности, как поле поиска
+            // главного окна.
+            if let Some(st) = unsafe { st_of(hwnd) } {
+                let p = theme::palette(st.dark);
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                unsafe {
+                    let _ = SetTextColor(hdc, p.text);
+                    let _ = SetBkColor(hdc, p.surface);
+                }
+                return LRESULT(st.hbr_surface.0 as isize);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_CTLCOLORSTATIC => {
+            // Подписи «Кому/Копия/Тема» и строка статуса — текст палитрой
+            // на фоне окна (иначе чёрные буквы теряются в тёмной теме).
+            if let Some(st) = unsafe { st_of(hwnd) } {
+                let p = theme::palette(st.dark);
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                unsafe {
+                    let _ = SetTextColor(hdc, p.text);
+                    let _ = SetBkColor(hdc, p.bg);
+                }
+                return LRESULT(st.hbr_bg.0 as isize);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -625,6 +759,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_APP_COMPOSE_THEME => {
+            // Смена темы при открытом редакторе (фикс v0.3.11): главное окно
+            // присылает новую (wparam != 0 — тёмная) — перекрашиваемся.
+            if let Some(st) = unsafe { st_of(hwnd) } {
+                st.dark = wparam.0 != 0;
+                unsafe { apply_theme(hwnd, st) };
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             // Таймер автосохранения гаснет вместе с окном (TASK-N08).
             let _ = unsafe { KillTimer(Some(hwnd), IDT_DRAFT_AUTOSAVE) };
@@ -635,6 +778,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             );
             if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe {
+                    // Кисти темы (фикс v0.3.11) — наши, освобождаем сами.
+                    if !st.hbr_bg.is_invalid() {
+                        let _ = DeleteObject(HGDIOBJ(st.hbr_bg.0));
+                    }
+                    if !st.hbr_surface.is_invalid() {
+                        let _ = DeleteObject(HGDIOBJ(st.hbr_surface.0));
+                    }
                     let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                         Some(st.parent),
                         WM_APP_COMPOSE_CLOSED,
