@@ -104,8 +104,18 @@ TASK-082 (FTS5-индекс в SQLite). Ядро уже умеет всё это
   крейта, `EM_SETCUEBANNER/EM_SETSEL` — локальные константы с верными
   значениями (5377/177). Транзитивно верно и для `VK_RETURN/VK_ESCAPE`
   (`VIRTUAL_KEY(u16)`).
-- Сборка/тесты/clippy — на машине владельца (AutoClaw), см. протокол
-  уровня A/T в `docs/WORKFLOW.md`.
+- Сборка/тесты/clippy — на машине владельца (AutoClaw 2.4.0): код
+  писался вне Windows-машины, первая сборка на ней вскрыла 5 мелких
+  расхождений (E0609: счётчик непрочитанных — `m.hdr.seen`, не `m.seen`;
+  edition-2024 `unsafe {}` вокруг `layout` в wndproc; каст сабкласс-прок
+  `as *const () as isize`; лишний импорт `KillTimer`; выравнивание таблицы
+  ускорителей — CreateAcceleratorTableW на x64 требует буфер >= 4 байт
+  (golang/go#64729), а [ACCEL; _] выровнен на 2, из-за чего запуск
+  эпизодически падал с ERROR_NOACCESS 0x800703E6; таблица обёрнута
+  в `#[repr(C, align(8))]`). Правки минимальные, каждая записана
+  в `docs/build-log.txt`. После правок (v0.3.1): `cargo build --release` —
+  чисто, `cargo test` — 55 passed / 0 failed / 1 ignored,
+  `cargo clippy --all-targets -- -D warnings` — чисто.
 
 ### Чек-лист приёмки (уровень A + T)
 

@@ -121,6 +121,13 @@ pub fn create_fonts() -> (HFONT, HFONT) {
 }
 
 /// Меню + таблица ускорителей. Возвращает HACCEL для цикла сообщений.
+/// CreateAcceleratorTableW на x64 требует выравнивания буфера >= 4 байт
+/// (golang/go#64729); [ACCEL; _] выровнен на 2 — вызов эпизодически падал
+/// с ERROR_NOACCESS (0x800703E6) и приложение молча закрывалось.
+/// Оборачиваем таблицу в align(8).
+#[repr(C, align(8))]
+struct AccelTable([ACCEL; 9]);
+
 pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
     unsafe {
         let bar = CreateMenu()?;
@@ -180,7 +187,7 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
 
         SetMenu(hwnd, Some(bar))?;
 
-        let accels = [
+        let accels = AccelTable([
             ACCEL {
                 fVirt: FVIRTKEY | FCONTROL | FNOINVERT,
                 key: 0x4E, // N
@@ -227,8 +234,8 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
                 key: 0x1B, // Esc — закрыть поиск (вне поля — игнорируется)
                 cmd: IDM_SEARCH_CLOSE,
             },
-        ];
-        CreateAcceleratorTableW(&accels)
+        ]);
+        CreateAcceleratorTableW(&accels.0)
     }
 }
 
@@ -459,7 +466,7 @@ pub fn show_folder(hwnd_list: HWND, st: &mut AppState, key: &str) {
         );
         let _ = InvalidateRect(Some(hwnd_list), None, false);
     }
-    let unread = st.rows.iter().filter(|m| !m.seen).count();
+    let unread = st.rows.iter().filter(|m| !m.hdr.seen).count();
     let (_, disp) = split_key(key);
     status_text(
         st,

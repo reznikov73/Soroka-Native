@@ -58,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, GA_ROOT, GetAncestor,
     GetClientRect, GetMessageW, GetParent, GWLP_USERDATA, GWLP_WNDPROC, GetWindowLongPtrW,
     IDC_ARROW, LoadCursorW, MB_ICONINFORMATION, MB_OK, MB_YESNO, MINMAXINFO, MSG, MessageBoxW,
-    KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, SWP_NOZORDER, SW_SHOW, SendMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SWP_NOZORDER, SW_SHOW, SendMessageW,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateAcceleratorW, TranslateMessage,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND, WM_DESTROY, WM_GETMINMAXINFO,
     WM_KEYDOWN, WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW,
@@ -392,16 +392,16 @@ unsafe extern "system" fn wndproc(
             match id {
                 IDM_SEARCH_FOCUS => {
                     enter_search(st.hwnd_list, st);
-                    layout(hwnd, st);
+                    unsafe { layout(hwnd, st) };
                 }
                 IDM_SEARCH_GO => {
                     fire_search(hwnd, st.hwnd_list, st);
                     // Пустой запрос мог закрыть поиск — полоса над списком исчезает.
-                    layout(hwnd, st);
+                    unsafe { layout(hwnd, st) };
                 }
                 IDM_SEARCH_CLOSE => {
                     exit_search(hwnd, st.hwnd_list, st);
-                    layout(hwnd, st);
+                    unsafe { layout(hwnd, st) };
                 }
                 IDM_EXIT => {
                     let _ = unsafe { DestroyWindow(hwnd) };
@@ -575,7 +575,7 @@ unsafe extern "system" fn wndproc(
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             if st.search_query.is_some() {
                 fire_search(hwnd, st.hwnd_list, st);
-                layout(hwnd, st);
+                unsafe { layout(hwnd, st) };
             }
             LRESULT(0)
         }
@@ -707,7 +707,7 @@ fn run() -> Result<()> {
         let orig = SetWindowLongPtrW(
             st.hwnd_search,
             GWLP_WNDPROC,
-            search_edit_proc as isize,
+            search_edit_proc as *const () as isize,
         );
         SetWindowLongPtrW(st.hwnd_search, GWLP_USERDATA, orig);
     }
