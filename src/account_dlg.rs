@@ -6,18 +6,18 @@
 
 use std::sync::mpsc::Sender;
 
-use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
-    ES_AUTOHSCROLL, ES_PASSWORD, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_ARROW,
-    LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WM_SIZE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, RegisterClassW,
+    BN_CLICKED, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL,
+    ES_PASSWORD, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_ARROW, LoadCursorW,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW, RegisterClassW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WM_SIZE, WNDCLASSW,
+    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
+use windows::core::{PCWSTR, w};
 
 use crate::backend::{Job, LoginOutcome, WM_APP_LOGIN_RESULT};
 use crate::state::AppState;
@@ -114,9 +114,19 @@ pub fn open(hwnd_main: HWND, st: &AppState) -> Option<HWND> {
         .expect("создать окно ящика")
     };
     unsafe {
+        // Геометрия из layout.json (TASK-N06): нормальный прямоугольник до
+        // показа; развёрнутость — в ShowWindow.
+        let maximized = crate::layout_store::load()
+            .and_then(|l| l.account)
+            .map(|p| crate::ui::restore_placement(hwnd, &p))
+            .unwrap_or(false);
         let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
             hwnd,
-            windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
+            if maximized {
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWMAXIMIZED
+            } else {
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOW
+            },
         );
     }
     Some(hwnd)
@@ -213,9 +223,21 @@ unsafe fn layout(hwnd: HWND, st: &AccountState) {
     unsafe {
         move_window(st.hwnd_email, m + 130, 16, (w - m * 2 - 130).max(160), 24);
         move_window(st.hwnd_pass, m + 130, 48, (w - m * 2 - 130).max(160), 24);
-        move_window(st.hwnd_imap_host, m + 130, 80, (w - m * 2 - 130).max(160), 24);
+        move_window(
+            st.hwnd_imap_host,
+            m + 130,
+            80,
+            (w - m * 2 - 130).max(160),
+            24,
+        );
         move_window(st.hwnd_imap_port, m + 130, 112, 110, 24);
-        move_window(st.hwnd_smtp_host, m + 130, 144, (w - m * 2 - 130).max(160), 24);
+        move_window(
+            st.hwnd_smtp_host,
+            m + 130,
+            144,
+            (w - m * 2 - 130).max(160),
+            24,
+        );
         move_window(st.hwnd_smtp_port, m + 130, 176, 110, 24);
         move_window(st.hwnd_btn_test, m, h - 44, 190, 30);
         move_window(st.hwnd_btn_save, m + 210, h - 44, 130, 30);
@@ -224,17 +246,11 @@ unsafe fn layout(hwnd: HWND, st: &AccountState) {
     }
 }
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_NCCREATE => {
             let cs = unsafe {
-                &*(lparam.0
-                    as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW)
+                &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW)
             };
             unsafe {
                 windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
@@ -261,20 +277,14 @@ unsafe extern "system" fn wndproc(
                     ("SMTP-порт:", 176, IDC_SMTP_PORT, false),
                 ];
                 for (label, y, id, is_pass) in fields {
-                    let h = child(
-                        hwnd,
-                        w!("STATIC"),
-                        Some(label),
-                        0,
-                        14,
-                        y + 3,
-                        118,
-                        20,
-                        -1,
-                    );
+                    let h = child(hwnd, w!("STATIC"), Some(label), 0, 14, y + 3, 118, 20, -1);
                     set_font(h, hfont);
                     let (class, style, text) = if is_pass {
-                        (w!("EDIT"), WS_TABSTOP.0 | ES_AUTOHSCROLL as u32 | ES_PASSWORD as u32, None)
+                        (
+                            w!("EDIT"),
+                            WS_TABSTOP.0 | ES_AUTOHSCROLL as u32 | ES_PASSWORD as u32,
+                            None,
+                        )
                     } else {
                         (w!("EDIT"), edit_style, None)
                     };
@@ -389,6 +399,11 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            // Геометрия окна — в layout.json (TASK-N06).
+            crate::layout_store::store_window(
+                crate::layout_store::WinKind::Account,
+                crate::ui::snapshot_placement(hwnd),
+            );
             if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe {
                     let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -413,12 +428,7 @@ unsafe extern "system" fn wndproc(
 
 /// Домен из email.
 fn email_domain(email: &str) -> String {
-    email
-        .rsplit('@')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_lowercase()
+    email.rsplit('@').next().unwrap_or("").trim().to_lowercase()
 }
 
 /// IMAP-хост по домену; SMTP — из IMAP («imap.X» → «smtp.X»).
@@ -454,8 +464,14 @@ unsafe fn read_form(st: &AccountState) -> Form {
     let smtp_host_raw = read_text(st.hwnd_smtp_host);
     let (imap_host, smtp_host) = default_hosts(&email, &imap_host_raw);
     let _ = smtp_host_raw;
-    let imap_port = read_text(st.hwnd_imap_port).trim().parse::<u16>().unwrap_or(993);
-    let smtp_port = read_text(st.hwnd_smtp_port).trim().parse::<u16>().unwrap_or(465);
+    let imap_port = read_text(st.hwnd_imap_port)
+        .trim()
+        .parse::<u16>()
+        .unwrap_or(993);
+    let smtp_port = read_text(st.hwnd_smtp_port)
+        .trim()
+        .parse::<u16>()
+        .unwrap_or(465);
     Form {
         email,
         password,
@@ -561,27 +577,23 @@ unsafe fn on_save(hwnd: HWND) {
         0,     // автопроверка — Фаза 2
         false, // чистка корзины при выходе — Фаза 2
     ) {
-        Ok(_) => {
-            unsafe {
-                MessageBoxW(
-                    Some(hwnd),
-                    w!("Ящик сохранён."),
-                    w!("POS Mail"),
-                    MB_OK | MB_ICONINFORMATION,
-                );
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    Some(st.parent),
-                    WM_APP_ACCOUNT_SAVED,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-                let _ = DestroyWindow(hwnd);
-            }
-        }
-        Err(e) => {
-            unsafe {
-                let _ = set_text(st.hwnd_status, &format!("не сохранено: {e}"));
-            }
-        }
+        Ok(_) => unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                w!("Ящик сохранён."),
+                w!("POS Mail"),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(st.parent),
+                WM_APP_ACCOUNT_SAVED,
+                WPARAM(0),
+                LPARAM(0),
+            );
+            let _ = DestroyWindow(hwnd);
+        },
+        Err(e) => unsafe {
+            let _ = set_text(st.hwnd_status, &format!("не сохранено: {e}"));
+        },
     }
 }

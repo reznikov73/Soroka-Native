@@ -64,11 +64,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWLP_USERDATA, GWLP_WNDPROC, GetAncestor, GetClientRect, GetMenu, GetMessageW, GetParent,
     GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_BYCOMMAND,
     MF_CHECKED, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_SHOW, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR,
-    WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    RegisterClassW, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOZORDER, SendMessageW, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateAcceleratorW, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCCREATE, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE, WM_TIMER,
+    WNDCLASSW, WNDPROC, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
@@ -83,7 +83,7 @@ use ui::{
     apply_mail_event, apply_theme, create_fonts, create_menu, empty_pane_html, enter_search,
     exit_search, fire_search, letter_html, on_get_disp_info, on_list_custom_draw,
     on_list_item_changed, on_tree_select, rebuild_tree, register_splitter_class,
-    register_status_class, setup_list_columns, status_text,
+    register_status_class, restore_placement, setup_list_columns, snapshot_placement, status_text,
 };
 
 const WINDOW_CLASS: PCWSTR = w!("SorokaNativeWnd");
@@ -734,6 +734,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
+            // Геометрия главного окна — в layout.json (TASK-N06), до
+            // PostQuitMessage: дальше цикл сообщений завершится.
+            layout_store::store_window(layout_store::WinKind::Main, snapshot_placement(hwnd));
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -774,15 +777,18 @@ fn run() -> Result<()> {
 
     // Состояние уходит в GWLP_USERDATA через CREATESTRUCTW (WM_NCCREATE).
     let state = Box::into_raw(Box::new(AppState::new(font, font_bold)));
-    // Веса панелей и тема из %APPDATA%\Soroka\layout.json (TASK-N04/N05);
-    // нет файла — дефолт как в Soroka (веса LAYOUT_DEFAULTS, тёмная тема).
-    if let Some((wf, wl, wr, dark)) = layout_store::load() {
+    // Компоновка из %APPDATA%\Soroka\layout.json (TASK-N04/N05/N06):
+    // веса, тема, геометрия главного окна; нет файла — дефолт Soroka
+    // (веса LAYOUT_DEFAULTS, тёмная тема, системная позиция окна).
+    let mut main_placement = None;
+    if let Some(l) = layout_store::load() {
         unsafe {
-            (*state).wf = wf;
-            (*state).wl = wl;
-            (*state).wr = wr;
-            (*state).dark = dark;
+            (*state).wf = l.wf;
+            (*state).wl = l.wl;
+            (*state).wr = l.wr;
+            (*state).dark = l.dark;
         }
+        main_placement = l.main;
     }
     let hwnd = unsafe {
         CreateWindowExW(
@@ -975,8 +981,14 @@ fn run() -> Result<()> {
     }
 
     unsafe {
+        // Геометрия главного окна из layout.json (TASK-N06) — до показа:
+        // SetWindowPlacement ставит нормальный прямоугольник скрытому окну,
+        // развёрнутость уходит в ShowWindow ниже.
+        let maximized = main_placement
+            .map(|p| restore_placement(hwnd, &p))
+            .unwrap_or(false);
         layout(hwnd, st);
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
         let _ = SetFocus(Some(st.hwnd_list));
     }
 

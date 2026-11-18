@@ -28,11 +28,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateAcceleratorTableW, CreateMenu,
     CreatePopupMenu, DefWindowProcW, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, GWLP_USERDATA,
-    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HACCEL,
-    IDC_ARROW, IDC_SIZEWE, KillTimer, LoadCursorW, MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, NONCLIENTMETRICSW, RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetMenu,
-    SetWindowLongPtrW, ShowWindow, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SIZE, WNDCLASSW,
+    GetClientRect, GetParent, GetSystemMetrics, GetWindowLongPtrW, GetWindowPlacement,
+    GetWindowTextLengthW, GetWindowTextW, HACCEL, IDC_ARROW, IDC_SIZEWE, KillTimer, LoadCursorW,
+    MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW, RegisterClassW,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW,
+    SW_SHOWMAXIMIZED, SendMessageW, SetMenu, SetWindowLongPtrW, SetWindowPlacement, ShowWindow,
+    WINDOWPLACEMENT, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SIZE, WNDCLASSW,
 };
 use windows::core::{Error, HSTRING, PCWSTR, w};
 
@@ -55,11 +57,9 @@ pub const SPLIT_W: i32 = 6;
 /// Минимальная ширина панели при перетаскивании — clamp из dragSplit Soroka (110px).
 pub const PANE_MIN: i32 = 110;
 
-/// Веса панелей по умолчанию — LAYOUT_DEFAULTS из Soroka (окт 2026,
-/// согласовано с пользователем: узкие папки, широкое письмо).
-pub const WF_DEF: f64 = 0.2827;
-pub const WL_DEF: f64 = 1.2443;
-pub const WR_DEF: f64 = 2.023;
+// Веса панелей по умолчанию переехали в layout_store (TASK-N06: это их
+// дом — layout.json); переиспользуем для state.rs и сплиттеров.
+pub use crate::layout_store::{WF_DEF, WL_DEF, WR_DEF};
 
 /// Идентификаторы команд меню.
 pub const IDM_EXIT: u16 = 100;
@@ -623,6 +623,74 @@ pub fn apply_theme(st: &mut AppState) {
             let _ = InvalidateRect(Some(h), None, true);
         }
     }
+}
+
+// ===== Геометрия окон (TASK-N06) =====
+
+/// Снять геометрию окна для layout.json: нормальная позиция/размер
+/// (WINDOWPLACEMENT корректен и для развёрнутого окна — отдаёт прямоугольник
+/// НЕразвёрнутого состояния) и флаг «развёрнуто».
+pub fn snapshot_placement(hwnd: HWND) -> layout_store::WinPlacement {
+    let mut wp = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    let r = if unsafe { GetWindowPlacement(hwnd, &mut wp) }.is_ok() {
+        wp.rcNormalPosition
+    } else {
+        RECT::default()
+    };
+    layout_store::WinPlacement {
+        x: r.left,
+        y: r.top,
+        w: r.right - r.left,
+        h: r.bottom - r.top,
+        maximized: wp.showCmd == SW_SHOWMAXIMIZED.0 as u32,
+    }
+}
+
+/// Восстановить геометрию окна (TASK-N06): нормальный прямоугольник —
+/// через SetWindowPlacement (рабочие координаты, ровно как снято), окно
+/// пока скрыто. Возвращает true, если окно было развёрнуто — показывать
+/// тогда SW_SHOWMAXIMIZED.
+pub fn restore_placement(hwnd: HWND, p: &layout_store::WinPlacement) -> bool {
+    let mut rc = RECT {
+        left: p.x,
+        top: p.y,
+        right: p.x + p.w.max(200),
+        bottom: p.y + p.h.max(120),
+    };
+    clamp_to_virtual_screen(&mut rc);
+    let wp = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        rcNormalPosition: rc,
+        showCmd: SW_HIDE.0 as u32,
+        ..Default::default()
+    };
+    let _ = unsafe { SetWindowPlacement(hwnd, &wp) };
+    p.maximized
+}
+
+/// Не дать окну улететь за экран (мониторы меняются между запусками):
+/// на виртуальном рабочем столе должна остаться полоса не меньше 150×60.
+fn clamp_to_virtual_screen(r: &mut RECT) {
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if vw <= 0 || vh <= 0 {
+        return;
+    }
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    r.left = r.left.clamp(vx - w + 150, vx + vw - 150);
+    r.top = r.top.clamp(vy - h + 60, vy + vh - 60);
+    r.right = r.left + w;
+    r.bottom = r.top + h;
 }
 
 /// Колонки виртуального списка писем.

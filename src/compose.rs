@@ -6,7 +6,6 @@
 
 use std::sync::mpsc::Sender;
 
-use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -16,14 +15,14 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
-    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GWLP_USERDATA,
-    GetClientRect, GetWindowLongPtrW, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT,
-    LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, IDC_ARROW, MessageBoxW, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WM_SIZE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
-    RegisterClassW,
+    BN_CLICKED, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL,
+    ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW,
+    IDC_ARROW, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LBS_NOTIFY, LoadCursorW, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_OK, MessageBoxW, RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
+use windows::core::{PCWSTR, w};
 
 use crate::backend::{Job, SendOutcome, WM_APP_SEND_RESULT};
 use crate::mail::smtp::OutgoingAttachment;
@@ -144,9 +143,19 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
     }
 
     unsafe {
+        // Геометрия из layout.json (TASK-N06): нормальный прямоугольник до
+        // показа; развёрнутость — в ShowWindow.
+        let maximized = crate::layout_store::load()
+            .and_then(|l| l.compose)
+            .map(|p| crate::ui::restore_placement(hwnd, &p))
+            .unwrap_or(false);
         let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
             hwnd,
-            windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
+            if maximized {
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWMAXIMIZED
+            } else {
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOW
+            },
         );
         let _ = SetFocus(Some((*raw).hwnd_subject));
     }
@@ -263,41 +272,17 @@ unsafe fn layout(hwnd: HWND, st: &ComposeState) {
             w - 2 * m,
             (h - body_y - bottom_h).max(60),
         );
-        move_window(
-            st.hwnd_btn_send,
-            w - m - 130,
-            h - 38,
-            130,
-            30,
-        );
-        move_window(
-            st.hwnd_btn_cancel,
-            w - m - 250,
-            h - 38,
-            110,
-            30,
-        );
-        move_window(
-            st.hwnd_status,
-            m,
-            h - 30,
-            (w - 2 * m - 270).max(120),
-            24,
-        );
+        move_window(st.hwnd_btn_send, w - m - 130, h - 38, 130, 30);
+        move_window(st.hwnd_btn_cancel, w - m - 250, h - 38, 110, 30);
+        move_window(st.hwnd_status, m, h - 30, (w - 2 * m - 270).max(120), 24);
     }
 }
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_NCCREATE => {
             let cs = unsafe {
-                &*(lparam.0
-                    as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW)
+                &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW)
             };
             unsafe {
                 windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
@@ -316,17 +301,7 @@ unsafe extern "system" fn wndproc(
             unsafe {
                 // Подписи.
                 for (text, y) in [("Кому:", 17), ("Копия:", 49), ("Тема:", 81)] {
-                    let h = child(
-                        hwnd,
-                        w!("STATIC"),
-                        Some(text),
-                        0,
-                        12,
-                        y,
-                        84,
-                        20,
-                        -1,
-                    );
+                    let h = child(hwnd, w!("STATIC"), Some(text), 0, 12, y, 84, 20, -1);
                     set_font(h, hfont);
                 }
                 // Поля.
@@ -493,15 +468,17 @@ unsafe extern "system" fn wndproc(
                 st.sending = false;
                 unsafe {
                     let _ = EnableWindow(st.hwnd_btn_send, true);
-                    let _ = set_text(
-                        st.hwnd_status,
-                        &format!("не отправлено: {}", outcome.msg),
-                    );
+                    let _ = set_text(st.hwnd_status, &format!("не отправлено: {}", outcome.msg));
                 }
             }
             LRESULT(0)
         }
         WM_DESTROY => {
+            // Геометрия окна — в layout.json (TASK-N06).
+            crate::layout_store::store_window(
+                crate::layout_store::WinKind::Compose,
+                crate::ui::snapshot_placement(hwnd),
+            );
             if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe {
                     let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(

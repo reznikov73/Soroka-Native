@@ -1,14 +1,38 @@
-//! Сохранение компоновки панелей (TASK-N04): веса дерева/списка/тела.
-//! Хранится рядом с общими данными Soroka: %APPDATA%\Soroka\layout.json.
+//! Сохранение компоновки (TASK-N04/N05/N06): веса панелей, тема и
+//! геометрия окон — один файл %APPDATA%\Soroka\layout.json.
 //! У Soroka то же самое лежит в localStorage «soroka.layout2» — файлы
-//! не конфликтуют (кэш и аккаунты общие, компоновка — своя у каждой оболочки).
-//!
-//! TASK-N05: в тот же файл пишется тема оболочки (dark/light). Это наш
-//! собственный файл, данные Soroka не затрагиваются; срез N09 перенесёт
-//! тему в общий settings.json (порт ядра) — до тех пор живёт здесь.
+//! не конфликтуют (кэш и аккаунты общие, компоновка — своя у каждой
+//! оболочки). Срез N09 перенесёт тему в общий settings.json (порт ядра);
+//! веса и геометрия остаются здесь — это состояние оболочки.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Веса панелей по умолчанию — LAYOUT_DEFAULTS из Soroka (окт 2026,
+/// согласовано с пользователем: узкие папки, широкое письмо). Живут тут:
+/// layout.json — их дом, ui.rs переиспользует.
+pub const WF_DEF: f64 = 0.2827;
+pub const WL_DEF: f64 = 1.2443;
+pub const WR_DEF: f64 = 2.023;
+
+/// Геометрия окна (TASK-N06): нормальная позиция/размер (когда окно не
+/// развёрнуто) и флаг «было развёрнуто».
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WinPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+/// Какое окно кладём в layout.json.
+pub enum WinKind {
+    Main,
+    Compose,
+    Account,
+}
 
 #[derive(Serialize, Deserialize)]
 struct Weights {
@@ -17,13 +41,42 @@ struct Weights {
     reading: f64,
 }
 
-#[derive(Serialize, Deserialize)]
+impl Default for Weights {
+    fn default() -> Self {
+        Self {
+            folders: WF_DEF,
+            list: WL_DEF,
+            reading: WR_DEF,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
 struct LayoutFile {
+    #[serde(default)]
     weights: Weights,
-    /// «dark» (дефолт, как в Soroka) или «light». В старых файлах нет —
-    /// serde подставит None, вызывающий берёт тёмную.
+    /// «dark» (дефолт, как в Soroka) или «light» — TASK-N05.
     #[serde(default)]
     theme: Option<String>,
+    /// Геометрия окон — TASK-N06 (в старых файлах нет — serde даст None).
+    #[serde(default)]
+    main: Option<WinPlacement>,
+    #[serde(default)]
+    compose: Option<WinPlacement>,
+    #[serde(default)]
+    account: Option<WinPlacement>,
+}
+
+/// Загруженная компоновка.
+#[derive(Debug, PartialEq)]
+pub struct Layout {
+    pub wf: f64,
+    pub wl: f64,
+    pub wr: f64,
+    pub dark: bool,
+    pub main: Option<WinPlacement>,
+    pub compose: Option<WinPlacement>,
+    pub account: Option<WinPlacement>,
 }
 
 fn file_path() -> Option<PathBuf> {
@@ -33,48 +86,94 @@ fn file_path() -> Option<PathBuf> {
     Some(p)
 }
 
-/// Веса и тема из layout.json; None — файла нет или данные невалидны
-/// (тогда вызывающий берёт дефолт из Soroka: веса LAYOUT_DEFAULTS, тёмная).
-pub fn load() -> Option<(f64, f64, f64, bool)> {
+/// Компоновка из layout.json; None — файла нет или он битый (then
+/// вызывающий берёт дефолты: веса LAYOUT_DEFAULTS, тёмная тема).
+pub fn load() -> Option<Layout> {
     load_from(file_path()?.as_path())
 }
 
+/// Сохранить веса и тему; геометрия окон в файле сохраняется
+/// (read-modify-write: она пишется отдельно, при закрытии окон).
 pub fn save(wf: f64, wl: f64, wr: f64, dark: bool) {
     if let Some(p) = file_path() {
-        save_to(&p, wf, wl, wr, dark);
+        save_at(&p, wf, wl, wr, dark);
     }
 }
 
-fn load_from(path: &Path) -> Option<(f64, f64, f64, bool)> {
-    let s = std::fs::read_to_string(path).ok()?;
-    let f: LayoutFile = serde_json::from_str(&s).ok()?;
-    let w = f.weights;
-    let ok = [w.folders, w.list, w.reading]
-        .iter()
-        .all(|v| v.is_finite() && *v > 0.0);
-    ok.then_some((
-        w.folders,
-        w.list,
-        w.reading,
-        f.theme.as_deref() != Some("light"),
-    ))
+/// Записать геометрию окна (TASK-N06): вызывается при закрытии окна;
+/// веса/тема/геометрия остальных окон в файле не трогаются.
+pub fn store_window(kind: WinKind, wp: WinPlacement) {
+    if let Some(p) = file_path() {
+        store_window_at(&p, kind, wp);
+    }
 }
 
-fn save_to(path: &Path, wf: f64, wl: f64, wr: f64, dark: bool) {
-    if let Some(dir) = path.parent() {
+fn save_at(p: &Path, wf: f64, wl: f64, wr: f64, dark: bool) {
+    let mut f = read_or_default(p);
+    f.weights = Weights {
+        folders: wf,
+        list: wl,
+        reading: wr,
+    };
+    f.theme = Some(if dark { "dark" } else { "light" }.to_string());
+    write(p, &f);
+}
+
+fn store_window_at(p: &Path, kind: WinKind, wp: WinPlacement) {
+    let mut f = read_or_default(p);
+    match kind {
+        WinKind::Main => f.main = Some(wp),
+        WinKind::Compose => f.compose = Some(wp),
+        WinKind::Account => f.account = Some(wp),
+    }
+    write(p, &f);
+}
+
+fn read_or_default(p: &Path) -> LayoutFile {
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write(p: &Path, f: &LayoutFile) {
+    if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let body = serde_json::to_string(&LayoutFile {
-        weights: Weights {
-            folders: wf,
-            list: wl,
-            reading: wr,
-        },
-        theme: Some(if dark { "dark" } else { "light" }.to_string()),
-    });
-    if let Ok(body) = body {
-        let _ = std::fs::write(path, body);
+    if let Ok(body) = serde_json::to_string(f) {
+        let _ = std::fs::write(p, body);
     }
+}
+
+fn load_from(path: &Path) -> Option<Layout> {
+    let f: LayoutFile = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    // Невалидные веса (ноль/NaN — файл правили руками) молча заменяем
+    // дефолтами: тема и геометрия при этом не теряются.
+    let ok = |v: f64| v.is_finite() && v > 0.0;
+    let wf = if ok(f.weights.folders) {
+        f.weights.folders
+    } else {
+        WF_DEF
+    };
+    let wl = if ok(f.weights.list) {
+        f.weights.list
+    } else {
+        WL_DEF
+    };
+    let wr = if ok(f.weights.reading) {
+        f.weights.reading
+    } else {
+        WR_DEF
+    };
+    Some(Layout {
+        wf,
+        wl,
+        wr,
+        dark: f.theme.as_deref() != Some("light"),
+        main: f.main,
+        compose: f.compose,
+        account: f.account,
+    })
 }
 
 #[cfg(test)]
@@ -82,20 +181,63 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("soroka-layout-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("soroka-layout6-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("layout.json")
     }
 
     #[test]
-    fn weights_and_theme_roundtrip() {
+    fn full_roundtrip() {
         let p = tmp("roundtrip");
         assert_eq!(load_from(&p), None); // файла нет — дефолт за вызывающим
-        save_to(&p, 0.28, 1.24, 2.0, false);
-        assert_eq!(load_from(&p), Some((0.28, 1.24, 2.0, false)));
-        save_to(&p, 0.28, 1.24, 2.0, true);
-        assert_eq!(load_from(&p), Some((0.28, 1.24, 2.0, true)));
+        let wp = WinPlacement {
+            x: 10,
+            y: 20,
+            w: 800,
+            h: 600,
+            maximized: true,
+        };
+        store_window_at(&p, WinKind::Main, wp);
+        let l = load_from(&p).unwrap();
+        assert_eq!(l.main, Some(wp));
+        assert!((l.wf - WF_DEF).abs() < 1e-9); // веса не заданы — дефолт
+        assert!(l.dark); // тема не задана — тёмная
+        save_at(&p, 0.5, 1.0, 2.0, false);
+        let l = load_from(&p).unwrap();
+        assert!((l.wf - 0.5).abs() < 1e-9);
+        assert!(!l.dark);
+        assert_eq!(l.main, Some(wp)); // save() не теряет геометрию
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn store_window_keeps_other_windows() {
+        let p = tmp("keep");
+        let compose = WinPlacement {
+            x: 1,
+            y: 2,
+            w: 780,
+            h: 620,
+            maximized: false,
+        };
+        store_window_at(&p, WinKind::Compose, compose);
+        save_at(&p, 0.28, 1.24, 2.0, true);
+        let main = WinPlacement {
+            x: 5,
+            y: 6,
+            w: 1440,
+            h: 900,
+            maximized: false,
+        };
+        store_window_at(&p, WinKind::Main, main);
+        let l = load_from(&p).unwrap();
+        assert_eq!(l.main, Some(main));
+        assert_eq!(l.compose, Some(compose));
+        assert_eq!(l.account, None);
+        assert!(l.dark); // тема пережила store_window
+        assert!((l.wf - 0.28).abs() < 1e-9); // и веса тоже
         let _ = std::fs::remove_file(&p);
     }
 
@@ -108,7 +250,24 @@ mod tests {
             r#"{"weights":{"folders":0.28,"list":1.24,"reading":2.0}}"#,
         )
         .unwrap();
-        assert_eq!(load_from(&p), Some((0.28, 1.24, 2.0, true)));
+        let l = load_from(&p).unwrap();
+        assert!(l.dark);
+        assert!((l.wf - 0.28).abs() < 1e-9);
+        assert_eq!(l.main, None);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn broken_weights_fall_back_but_windows_survive() {
+        let p = tmp("broken-weights");
+        std::fs::write(
+            &p,
+            r#"{"weights":{"folders":0,"list":1.24,"reading":2.0},"main":{"x":1,"y":2,"w":3,"h":4}}"#,
+        )
+        .unwrap();
+        let l = load_from(&p).unwrap();
+        assert!((l.wf - WF_DEF).abs() < 1e-9); // нулевой вес — дефолт
+        assert_eq!(l.main.map(|m| m.x), Some(1)); // окно не потерялось
         let _ = std::fs::remove_file(&p);
     }
 
@@ -116,10 +275,7 @@ mod tests {
     fn broken_file_is_none() {
         let p = tmp("broken");
         std::fs::write(&p, "не json").unwrap();
-        assert_eq!(load_from(&p), None);
-        // Невалидные веса (ноль/NaN) — тоже None, без паники.
-        std::fs::write(&p, r#"{"weights":{"folders":0,"list":1,"reading":2}}"#).unwrap();
-        assert_eq!(load_from(&p), None);
+        assert!(load_from(&p).is_none());
         let _ = std::fs::remove_file(&p);
     }
 }
