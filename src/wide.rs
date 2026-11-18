@@ -5,9 +5,23 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Указатель на начало буфера `wide()`.
-pub fn wptr(s: &str) -> windows::core::PCWSTR {
-    windows::core::PCWSTR(wide(s).as_ptr())
+/// Записывает текст в окно: буфер живёт до конца вызова.
+///
+/// Заменяет собою прежний `wptr`: тот возвращал PCWSTR на ВРЕМЕННЫЙ Vec —
+/// память освобождалась сразу после выхода из функции, и SetWindowTextW
+/// читал уже освобождённый буфер (в теле ответа вместо цитаты оставалось
+/// 3 символа мусора).
+pub fn set_window_text(
+    hwnd: windows::Win32::Foundation::HWND,
+    text: &str,
+) -> windows::core::Result<()> {
+    let buf = wide(text);
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+            hwnd,
+            windows::core::PCWSTR(buf.as_ptr()),
+        )
+    }
 }
 
 /// Читает текст из Edit/Static окна (GetWindowTextW).

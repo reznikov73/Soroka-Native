@@ -28,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::backend::{Job, SendOutcome, WM_APP_SEND_RESULT};
 use crate::mail::smtp::OutgoingAttachment;
 use crate::state::AppState;
-use crate::wide::{read_text, wide, wptr};
+use crate::wide::{read_text, set_window_text, wide};
 
 /// Главное окно узнаёт о закрытии редактора.
 pub const WM_APP_COMPOSE_CLOSED: u32 = crate::backend::WM_APP_LOGIN_RESULT + 1;
@@ -154,7 +154,7 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
 }
 
 fn set_text(hwnd: HWND, text: &str) -> windows::core::Result<()> {
-    unsafe { windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, wptr(text)) }
+    set_window_text(hwnd, text)
 }
 
 unsafe fn st_of(hwnd: HWND) -> Option<&'static mut ComposeState> {

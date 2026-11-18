@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::backend::{Job, LoginOutcome, WM_APP_LOGIN_RESULT};
 use crate::state::AppState;
-use crate::wide::{read_text, wide, wptr};
+use crate::wide::{read_text, set_window_text, wide};
 
 /// Главное окно перестраивает дерево после сохранения ящика.
 pub const WM_APP_ACCOUNT_SAVED: u32 = crate::compose::WM_APP_COMPOSE_CLOSED + 1;
@@ -185,7 +185,7 @@ unsafe fn set_font(hwnd: HWND, font: HGDIOBJ) {
 }
 
 unsafe fn set_text(hwnd: HWND, text: &str) -> windows::core::Result<()> {
-    unsafe { windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, wptr(text)) }
+    set_window_text(hwnd, text)
 }
 
 unsafe fn move_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {

@@ -233,11 +233,13 @@ fn quote_body(hdr: &mail::imap::MessageHeader, pane: Option<&state::PaneBody>) -
             end -= 1;
         }
         cut.truncate(end);
-        cut.push_str("\n…(обрезано)");
+        cut.push_str("\r\n…(обрезано)");
     }
-    let quoted: String = cut.lines().map(|l| format!("> {l}\n")).collect();
+    // Многострочный EDIT в Win32 разделяет строки только по CRLF: с одиночным
+    // \n вся цитата ложится одной длинной строкой.
+    let quoted: String = cut.lines().map(|l| format!("> {l}\r\n")).collect();
     format!(
-        "\n\n----- Исходное письмо -----\nОт: {}\nКому: {}\nТема: {}\nДата: {}\n\n{}",
+        "\r\n\r\n----- Исходное письмо -----\r\nОт: {}\r\nКому: {}\r\nТема: {}\r\nДата: {}\r\n\r\n{}",
         hdr.from, hdr.to, hdr.subject, hdr.date, quoted
     )
 }
