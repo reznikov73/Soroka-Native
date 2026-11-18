@@ -72,19 +72,20 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CallWindowProcW, CheckMenuItem,
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL,
-    GA_ROOT, GWLP_USERDATA, GWLP_WNDPROC, GetAncestor, GetClientRect, GetForegroundWindow, GetMenu,
-    GetMessageW, GetParent, GetWindowLongPtrW, IDC_ARROW, IsIconic, IsWindowVisible, KillTimer,
-    LoadCursorW, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_BYCOMMAND, MF_CHECKED, MF_UNCHECKED,
-    MINMAXINFO, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED,
-    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR,
-    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NOTIFY, WM_PAINT,
-    WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    BeginDeferWindowPos, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CallWindowProcW,
+    CheckMenuItem, CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyIcon, DestroyWindow,
+    DispatchMessageW, EndDeferWindowPos, ES_AUTOHSCROLL, GA_ROOT, GWLP_USERDATA, GWLP_WNDPROC,
+    GetAncestor, GetClientRect, GetForegroundWindow, GetMenu, GetMessageW, GetParent,
+    GetWindowLongPtrW, IDC_ARROW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW,
+    MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_BYCOMMAND, MF_CHECKED, MF_UNCHECKED, MINMAXINFO, MSG,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateAcceleratorW, TranslateMessage, WS_EX_COMPOSITED, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NOTIFY,
+    WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
@@ -154,56 +155,34 @@ unsafe fn layout(hwnd: HWND, st: &mut AppState) {
     let x_split_pane = x_list + list_px;
     let x_pane = x_split_pane + SPLIT_W;
 
+    // Батч позиций всех детей одним DeferWindowPos: одна перерисовка вместо
+    // шести отдельных — иначе при drag сплиттера окно мерцает (TASK-N04).
+    let mut entries: Vec<(HWND, i32, i32, i32, i32)> = Vec::with_capacity(6);
+    entries.push((st.hwnd_tree, 0, 0, tree_px, h_main));
+    if search_open && !st.hwnd_search.0.is_null() {
+        entries.push((st.hwnd_search, x_list, 2, list_px, SEARCH_H - 4));
+    }
+    entries.push((st.hwnd_list, x_list, list_top, list_px, (h_main - list_top).max(0)));
+    entries.push((st.hwnd_split_tree, x_split_tree, 0, SPLIT_W, h_main));
+    entries.push((st.hwnd_split_pane, x_split_pane, 0, SPLIT_W, h_main));
+    if !st.hwnd_status.0.is_null() && h > STATUS_H {
+        entries.push((st.hwnd_status, 0, h - STATUS_H, w, STATUS_H));
+    }
     unsafe {
-        let _ = SetWindowPos(st.hwnd_tree, None, 0, 0, tree_px, h_main, SWP_NOZORDER);
-        if search_open && !st.hwnd_search.0.is_null() {
-            let _ = SetWindowPos(
-                st.hwnd_search,
-                None,
-                x_list,
-                2,
-                list_px,
-                SEARCH_H - 4,
-                SWP_NOZORDER,
-            );
-        }
-        let _ = SetWindowPos(
-            st.hwnd_list,
-            None,
-            x_list,
-            list_top,
-            list_px,
-            (h_main - list_top).max(0),
-            SWP_NOZORDER,
-        );
-        let _ = SetWindowPos(
-            st.hwnd_split_tree,
-            None,
-            x_split_tree,
-            0,
-            SPLIT_W,
-            h_main,
-            SWP_NOZORDER,
-        );
-        let _ = SetWindowPos(
-            st.hwnd_split_pane,
-            None,
-            x_split_pane,
-            0,
-            SPLIT_W,
-            h_main,
-            SWP_NOZORDER,
-        );
-        if !st.hwnd_status.0.is_null() && h > STATUS_H {
-            let _ = SetWindowPos(
-                st.hwnd_status,
-                None,
-                0,
-                h - STATUS_H,
-                w,
-                STATUS_H,
-                SWP_NOZORDER,
-            );
+        match BeginDeferWindowPos(entries.len() as i32) {
+            Ok(mut wpos) => {
+                for (h2, x, y, cx, cy) in &entries {
+                    wpos = DeferWindowPos(wpos, *h2, None, *x, *y, *cx, *cy, SWP_NOZORDER)
+                        .unwrap_or(wpos);
+                }
+                let _ = EndDeferWindowPos(wpos);
+            }
+            Err(_) => {
+                // Резервный путь (практически недостижим): по одному.
+                for (h2, x, y, cx, cy) in &entries {
+                    let _ = SetWindowPos(*h2, None, *x, *y, *cx, *cy, SWP_NOZORDER);
+                }
+            }
         }
         if !st.dragging
             && let Some(ctrl) = &st.controller
@@ -1090,7 +1069,9 @@ fn run() -> Result<()> {
     }
     let hwnd = unsafe {
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            // WS_EX_COMPOSITED: дети рисуются снизу вверх одним проходом —
+            // без него фон мелькает между перерисовками детей (TASK-N04).
+            WINDOW_EX_STYLE(WS_EX_COMPOSITED.0),
             WINDOW_CLASS,
             w!("POS Mail — Фаза 1: почтовый каркас"),
             WS_OVERLAPPEDWINDOW,
@@ -1206,6 +1187,17 @@ fn run() -> Result<()> {
             Some(ctx_split_pane as *const _),
         )?
     };
+
+    // Двойная буферизация дерева: без неё TreeView целиком перерисовывается
+    // на каждый шаг drag сплиттеров и ресайза (TASK-N04).
+    unsafe {
+        SendMessageW(
+            st.hwnd_tree,
+            windows::Win32::UI::Controls::TVM_SETEXTENDEDSTYLE,
+            Some(WPARAM(windows::Win32::UI::Controls::TVS_EX_DOUBLEBUFFER as usize)),
+            Some(LPARAM(windows::Win32::UI::Controls::TVS_EX_DOUBLEBUFFER as isize)),
+        );
+    }
 
     // Шрифт интерфейса всем детям (системный, подобранный под DPI).
     for h in [st.hwnd_tree, st.hwnd_list, st.hwnd_status, st.hwnd_search] {
