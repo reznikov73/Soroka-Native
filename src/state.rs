@@ -18,6 +18,15 @@ pub enum TreeSlot {
     Folder { key: String, name: String },
 }
 
+/// Строка списка: заголовок письма + папка, если строка из результатов поиска
+/// (TASK-N03). В режиме папки folder = None — строка относится к current_folder,
+/// в режиме поиска — Some(«id::ПАПКА») у каждой строки своя.
+#[derive(Debug, Clone)]
+pub struct ListRow {
+    pub hdr: MessageHeader,
+    pub folder: Option<String>,
+}
+
 /// Тело текущего письма (для показа и цитирования при ответе).
 pub struct PaneBody {
     pub uid: u32,
@@ -31,12 +40,17 @@ pub struct AppState {
     pub backend: Option<Backend>,
     /// Ящики из accounts.json.
     pub accounts: Vec<Account>,
-    /// Письма текущей папки (виртуальный список отдаёт их по LVN_GETDISPINFO).
-    pub rows: Vec<MessageHeader>,
+    /// Письма списка: папка или результаты поиска (виртуальный список отдаёт
+    /// их по LVN_GETDISPINFO).
+    pub rows: Vec<ListRow>,
     /// Ключ текущей папки «id::ИМЯ» (None — папка не выбрана).
     pub current_folder: Option<String>,
     /// Ящик текущей папки (для кнопки «написать»).
     pub current_account: Option<String>,
+    /// Активный поиск (TASK-N03): Some(q) — список показывает/ждёт результаты
+    /// «q» (пустая строка — поиск открыт, запрос ещё не выполнялся);
+    /// None — обычный режим папки.
+    pub search_query: Option<String>,
     /// UID выбранного письма (для ответа/удаления/вложений).
     pub selected_uid: Option<u32>,
     /// Тело показанного письма (для цитирования при ответе).
@@ -52,6 +66,8 @@ pub struct AppState {
     pub hwnd_tree: HWND,
     pub hwnd_list: HWND,
     pub hwnd_status: HWND,
+    /// Поле поиска над списком (скрыто, пока поиск не открыт) — TASK-N03.
+    pub hwnd_search: HWND,
     pub controller: Option<ICoreWebView2Controller>,
     pub webview: Option<ICoreWebView2>,
 
@@ -68,6 +84,7 @@ impl AppState {
             rows: Vec::new(),
             current_folder: None,
             current_account: None,
+            search_query: None,
             selected_uid: None,
             pane_body: None,
             tree_slots: Vec::new(),
@@ -76,6 +93,7 @@ impl AppState {
             hwnd_tree: HWND::default(),
             hwnd_list: HWND::default(),
             hwnd_status: HWND::default(),
+            hwnd_search: HWND::default(),
             controller: None,
             webview: None,
             font,

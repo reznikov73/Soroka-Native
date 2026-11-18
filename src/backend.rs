@@ -20,7 +20,10 @@ use crate::mail::accounts::{self, Account};
 use crate::mail::body::{self, AttachmentMeta};
 use crate::mail::imap::{self, FETCH_LIMIT};
 use crate::mail::smtp::{self, OutgoingAttachment};
-use crate::mail::store::Store;
+use crate::mail::store::{SearchHit, Store};
+
+/// Лимит выдачи поиска — как у команды Soroka (TASK-033/082).
+const SEARCH_LIMIT: usize = 200;
 
 /// Сообщение «пришли события из рабочего потока» (WM_APP + 0).
 pub const WM_APP_MAIL: u32 = WM_APP;
@@ -59,6 +62,8 @@ pub enum Job {
         user: String,
         password: String,
     },
+    /// Поиск FTS5 по всем папкам ящика (порт search_messages, TASK-082).
+    Search { account_id: String, query: String },
 }
 
 // В `Job` лежат HWND (hwnd_reply) — настоящие ручки окон, а не указатели на
@@ -101,6 +106,8 @@ pub enum MailEvent {
     AttachFailed { error: String },
     /// Очередь исходящих разослана после синхронизации (TASK-089).
     OutboxFlushed { sent: usize },
+    /// Результаты поиска; query — эхо, чтобы UI отбросил устаревшие (TASK-N03).
+    SearchDone { query: String, hits: Vec<SearchHit> },
     /// Информационное сообщение в статус-бар.
     Status(String),
 }
@@ -220,6 +227,20 @@ fn handle(job: Job) -> Vec<MailEvent> {
             post_boxed(hwnd_reply, WM_APP_LOGIN_RESULT, outcome);
             Vec::new()
         }
+        Job::Search { account_id, query } => search(&account_id, &query),
+    }
+}
+
+/// Порт search_messages (TASK-033/036/082): FTS5 по всем папкам ящика.
+fn search(account_id: &str, query: &str) -> Vec<MailEvent> {
+    match Store::open_default()
+        .and_then(|s| s.search_messages(account_id, None, query, SEARCH_LIMIT))
+    {
+        Ok(hits) => vec![MailEvent::SearchDone {
+            query: query.to_string(),
+            hits,
+        }],
+        Err(e) => vec![MailEvent::Status(format!("поиск: {e}"))],
     }
 }
 

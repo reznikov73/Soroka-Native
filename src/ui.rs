@@ -11,24 +11,26 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
-    CDRF_NOTIFYSUBITEMDRAW, HTREEITEM, LVCOLUMNW, LVCF_TEXT, LVCF_WIDTH, LVM_INSERTCOLUMNW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVS_EX_DOUBLEBUFFER,
+    CDRF_NOTIFYSUBITEMDRAW, HTREEITEM, LVCOLUMNW, LVCF_TEXT, LVCF_WIDTH, LVM_DELETECOLUMN,
+    LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVS_EX_DOUBLEBUFFER,
     LVS_EX_FULLROWSELECT, LVIF_TEXT, NMCUSTOMDRAW, NMLISTVIEW, NMLVDISPINFOW,
     NMTREEVIEWW, TVGN_CARET, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW,
     TVINSERTSTRUCTW_0, TVI_LAST, TVI_ROOT, TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW,
     TVM_SELECTITEM, TVE_EXPAND,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, MENU_ITEM_FLAGS, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, SendMessageW, SetMenu, HACCEL, ACCEL, CreateAcceleratorTableW,
-    FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, NONCLIENTMETRICSW,
+    AppendMenuW, CreateMenu, CreatePopupMenu, KillTimer, MENU_ITEM_FLAGS, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, SendMessageW, SetMenu, ShowWindow, HACCEL, ACCEL,
+    CreateAcceleratorTableW, SW_HIDE, SW_SHOW, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY,
+    NONCLIENTMETRICSW,
 };
 
 use crate::backend::{BodyData, MailEvent};
 use crate::mail::accounts::{load_accounts, split_key};
 use crate::mail::imap::MessageHeader;
 use crate::mail::store::Store;
-use crate::state::{AppState, PaneBody, TreeSlot};
+use crate::state::{AppState, ListRow, PaneBody, TreeSlot};
 use crate::wide::{escape_html, wide};
 
 /// Сообщение статус-бара (SB_SETTEXTW из commctrl: WM_USER + 11).
@@ -38,6 +40,8 @@ pub const SB_SET_TEXT: u32 = 0x040B;
 pub const TREE_W: i32 = 250;
 pub const PANE_W: i32 = 470;
 pub const STATUS_H: i32 = 26;
+/// Высота полосы поиска над списком (TASK-N03).
+pub const SEARCH_H: i32 = 30;
 
 /// Идентификаторы команд меню.
 pub const IDM_EXIT: u16 = 100;
@@ -49,6 +53,17 @@ pub const IDM_REPLY_ALL: u16 = 122;
 pub const IDM_FORWARD: u16 = 123;
 pub const IDM_DELETE: u16 = 124;
 pub const IDM_TOGGLE_SEEN: u16 = 125;
+pub const IDM_SEARCH_FOCUS: u16 = 130;
+pub const IDM_SEARCH_GO: u16 = 131;
+pub const IDM_SEARCH_CLOSE: u16 = 132;
+
+/// EN_CHANGE — уведомление EDIT о вводе (приходит через WM_COMMAND).
+/// В windows-rs константа лежит в WindowsAndMessaging — локальный псевдоним надёжен.
+pub const EN_CHANGE: u32 = 0x0300;
+/// Идентификатор таймера живого поиска (debounce 300 мс, как в Soroka).
+pub const IDT_SEARCH: usize = 1;
+/// EM_SETSEL (0x00B1) — выделение текста в EDIT.
+const EM_SETSEL: u32 = 0x00B1;
 
 /// Копирует UTF-16 строку в буфер элемента списка (с нулём на конце).
 pub fn copy_utf16(dst: windows::core::PWSTR, cap: i32, text: &str) {
@@ -141,6 +156,12 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
             w!("Прочитано / не прочитано\tCtrl+U"),
         );
 
+        item(
+            folder,
+            MF_STRING,
+            IDM_SEARCH_FOCUS as usize,
+            w!("Найти в ящике...\t/"),
+        );
         item(folder, MF_STRING, IDM_SYNC as usize, w!("Синхронизировать\tF5"));
 
         item(
@@ -195,6 +216,17 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
                 key: 0x74, // F5
                 cmd: IDM_SYNC,
             },
+            ACCEL {
+                // «/» — как в Soroka (TASK-080); VK_OEM_2 не зависит от раскладки.
+                fVirt: FVIRTKEY | FNOINVERT,
+                key: 0xBF,
+                cmd: IDM_SEARCH_FOCUS,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FNOINVERT,
+                key: 0x1B, // Esc — закрыть поиск (вне поля — игнорируется)
+                cmd: IDM_SEARCH_CLOSE,
+            },
         ];
         CreateAcceleratorTableW(&accels)
     }
@@ -232,6 +264,38 @@ unsafe fn lv_column(lv: HWND, index: usize, title: &str, cx: i32) {
             Some(WPARAM(index)),
             Some(LPARAM(&col as *const LVCOLUMNW as isize)),
         );
+    }
+}
+
+/// Переключение колонок списка: режим папки (4 колонки) ⇄ режим поиска
+/// (5, с колонкой «Папка»). Расширенные стили списка при этом не теряются.
+pub fn set_list_columns(hwnd_list: HWND, search: bool) {
+    let old = if search { 4 } else { 5 };
+    unsafe {
+        for _ in 0..old {
+            SendMessageW(
+                hwnd_list,
+                LVM_DELETECOLUMN,
+                Some(WPARAM(0)),
+                None,
+            );
+        }
+    }
+    if search {
+        unsafe {
+            lv_column(hwnd_list, 0, "Вл.", 44);
+            lv_column(hwnd_list, 1, "От", 200);
+            lv_column(hwnd_list, 2, "Тема", 350);
+            lv_column(hwnd_list, 3, "Папка", 150);
+            lv_column(hwnd_list, 4, "Дата", 140);
+        }
+    } else {
+        unsafe {
+            lv_column(hwnd_list, 0, "Вл.", 44);
+            lv_column(hwnd_list, 1, "От", 240);
+            lv_column(hwnd_list, 2, "Тема", 460);
+            lv_column(hwnd_list, 3, "Дата", 150);
+        }
     }
 }
 
@@ -364,6 +428,11 @@ pub fn on_tree_select(hwnd_list: HWND, st: &mut AppState, nm: &NMTREEVIEWW) {
     let Some(TreeSlot::Folder { key, .. }) = st.tree_slots.get(slot).cloned() else {
         return;
     };
+    // Выбор папки закрывает поиск (устаревший таймер отбросится
+    // в WM_TIMER по search_query == None).
+    if st.search_query.take().is_some() {
+        close_search_ui(hwnd_list, st);
+    }
     show_folder(hwnd_list, st, &key);
 }
 
@@ -377,7 +446,10 @@ pub fn show_folder(hwnd_list: HWND, st: &mut AppState, key: &str) {
     st.pane_body = None;
     st.rows = Store::open_default()
         .map(|s| s.load_folder(key).unwrap_or_default())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hdr| ListRow { hdr, folder: None })
+        .collect();
     unsafe {
         SendMessageW(
             hwnd_list,
@@ -400,6 +472,109 @@ pub fn show_folder(hwnd_list: HWND, st: &mut AppState, key: &str) {
     );
 }
 
+/// Открыть поиск: показать поле над списком, колонки с «Папкой», фокус в поле.
+/// Повторный вызов (например, «/» при открытом поиске) — просто фокус.
+pub fn enter_search(hwnd_list: HWND, st: &mut AppState) {
+    if st.search_query.is_none() {
+        st.search_query = Some(String::new());
+        set_list_columns(hwnd_list, true);
+        st.rows.clear();
+        st.selected_uid = None;
+        st.pane_body = None;
+        unsafe {
+            SendMessageW(
+                hwnd_list,
+                LVM_SETITEMCOUNT,
+                Some(WPARAM(0)),
+                None,
+            );
+            let _ = ShowWindow(st.hwnd_search, SW_SHOW);
+        }
+    }
+    unsafe {
+        let _ = SetFocus(Some(st.hwnd_search));
+        // Выделить прежний запрос — новый ввод начнётся с чистого поля.
+        SendMessageW(
+            st.hwnd_search,
+            EM_SETSEL,
+            Some(WPARAM(0)),
+            Some(LPARAM(-1isize)),
+        );
+    }
+    status_text(
+        st,
+        "поиск по всем папкам ящика: Enter или пауза — искать, Esc — к папке",
+    );
+}
+
+/// Закрыть поиск и вернуться к текущей папке (Esc, пустой запрос, выбор папки).
+pub fn exit_search(hwnd: HWND, hwnd_list: HWND, st: &mut AppState) {
+    if st.search_query.is_none() {
+        return; // поиск и так закрыт — ничего не дёргаем
+    }
+    st.search_query = None;
+    let _ = unsafe { KillTimer(Some(hwnd), IDT_SEARCH) };
+    close_search_ui(hwnd_list, st);
+    if let Some(key) = st.current_folder.clone() {
+        show_folder(hwnd_list, st, &key);
+    } else {
+        st.rows.clear();
+        unsafe {
+            SendMessageW(
+                hwnd_list,
+                LVM_SETITEMCOUNT,
+                Some(WPARAM(0)),
+                None,
+            );
+        }
+        status_text(st, "выберите папку");
+    }
+}
+
+/// Внешняя часть закрытия: спрятать поле и вернуть колонки папки.
+/// Вызывается и из on_tree_select (без таймера — устаревший WM_TIMER
+/// отбрасывается по search_query == None).
+fn close_search_ui(hwnd_list: HWND, st: &mut AppState) {
+    let _ = unsafe { ShowWindow(st.hwnd_search, SW_HIDE) };
+    set_list_columns(hwnd_list, false);
+}
+
+/// Запустить поиск по текущему тексту поля (Enter или сработавший debounce).
+pub fn fire_search(hwnd: HWND, hwnd_list: HWND, st: &mut AppState) {
+    let _ = unsafe { KillTimer(Some(hwnd), IDT_SEARCH) };
+    let q = crate::wide::read_text(st.hwnd_search).trim().to_string();
+    if q.is_empty() {
+        // Пустой запрос = выхода из поиска: предсказуемо и как в Soroka.
+        exit_search(hwnd, hwnd_list, st);
+        return;
+    }
+    let Some(account_id) = st
+        .current_account
+        .clone()
+        .or_else(|| st.accounts.first().map(|a| a.id.clone()))
+    else {
+        status_text(st, "ящики не настроены — искать не по чему");
+        return;
+    };
+    st.search_query = Some(q.clone());
+    st.rows.clear();
+    st.selected_uid = None;
+    st.pane_body = None;
+    unsafe {
+        SendMessageW(
+            hwnd_list,
+            LVM_SETITEMCOUNT,
+            Some(WPARAM(0)),
+            None,
+        );
+        let _ = InvalidateRect(Some(hwnd_list), None, false);
+    }
+    status_text(st, &format!("ищу «{q}»…"));
+    if let Some(b) = &st.backend {
+        b.post(crate::backend::Job::Search { account_id, query: q });
+    }
+}
+
 /// Ответ LVN_GETDISPINFOW: текст ячейки виртуального списка.
 pub fn on_get_disp_info(st: &mut AppState, nm: &mut NMLVDISPINFOW) {
     let i = nm.item.iItem as usize;
@@ -409,15 +584,20 @@ pub fn on_get_disp_info(st: &mut AppState, nm: &mut NMLVDISPINFOW) {
     let row = st.rows[i].clone();
     let text = match nm.item.iSubItem {
         0 => {
-            if row.has_attachments {
+            if row.hdr.has_attachments {
                 "+".to_string()
             } else {
                 String::new()
             }
         }
-        1 => row.from.clone(),
-        2 => row.subject.clone(),
-        _ => row.date.clone(),
+        1 => row.hdr.from.clone(),
+        2 => row.hdr.subject.clone(),
+        // В режиме поиска колонка 3 — папка письма; в режиме папки — дата.
+        3 => match &row.folder {
+            Some(key) => folder_display(&split_key(key).1),
+            None => row.hdr.date.clone(),
+        },
+        _ => row.hdr.date.clone(),
     };
     copy_utf16(nm.item.pszText, nm.item.cchTextMax, &text);
 }
@@ -429,7 +609,7 @@ pub fn on_list_custom_draw(st: &AppState, nm: &NMCUSTOMDRAW) -> LRESULT {
         CDDS_PREPAINT => LRESULT(CDRF_NOTIFYITEMDRAW as isize),
         stage if stage.0 & CDDS_ITEMPREPAINT.0 != 0 => {
             let i = nm.dwItemSpec;
-            let bold = st.rows.get(i).is_some_and(|m| !m.seen);
+            let bold = st.rows.get(i).is_some_and(|r| !r.hdr.seen);
             let hfont = if bold { st.font_bold } else { st.font };
             unsafe {
                 SelectObject(nm.hdc, HGDIOBJ(hfont.0));
@@ -452,23 +632,29 @@ pub fn on_list_item_changed(st: &mut AppState, nm: &NMLISTVIEW) {
     let Some(row) = st.rows.get(i) else {
         return;
     };
+    // Строка из результатов поиска: контекст (папка/ящик) берём из неё —
+    // ответ, удаление и флаги дальше работают с этой папкой.
+    if let Some(f) = &row.folder {
+        st.current_folder = Some(f.clone());
+        st.current_account = split_key(f).0;
+    }
     let key = st.current_folder.clone().unwrap_or_default();
     if key.is_empty() {
         return;
     }
-    st.selected_uid = Some(row.uid);
-    if st.pane_body.as_ref().is_some_and(|b| b.uid == row.uid) {
+    st.selected_uid = Some(row.hdr.uid);
+    if st.pane_body.as_ref().is_some_and(|b| b.uid == row.hdr.uid) {
         return; // уже показано
     }
     // Плейсхолдер, пока бэкенд тащит тело (кэш — мгновенно).
     if let Some(wv) = &st.webview {
-        let _ = unsafe { wv.NavigateToString(&HSTRING::from(loading_html(&row.subject))) };
+        let _ = unsafe { wv.NavigateToString(&HSTRING::from(loading_html(&row.hdr.subject))) };
     }
-    status_text(st, &format!("загрузка письма {}…", row.subject));
+    status_text(st, &format!("загрузка письма {}…", row.hdr.subject));
     if let Some(b) = &st.backend {
         b.post(crate::backend::Job::FetchBody {
             key,
-            uid: row.uid,
+            uid: row.hdr.uid,
         });
     }
 }
@@ -566,13 +752,13 @@ body { font-family: 'Segoe UI', sans-serif; background: #1c1e24; color: #8b93a3;
 
 /// Показ тела письма в панели (вызывается на BodyReady).
 pub fn show_body(st: &mut AppState, key: &str, uid: u32, from_cache: bool, body: BodyData) {
-    let Some(i) = st.rows.iter().position(|m| m.uid == uid) else {
+    let Some(i) = st.rows.iter().position(|m| m.hdr.uid == uid) else {
         return;
     };
     if st.current_folder.as_deref() != Some(key) || st.selected_uid != Some(uid) {
         return;
     }
-    let hdr = st.rows[i].clone();
+    let hdr = st.rows[i].hdr.clone();
     let was_unread = !hdr.seen;
     st.pane_body = Some(PaneBody {
         uid,
@@ -617,7 +803,10 @@ pub fn apply_mail_event(
                 let sel = st.current_folder.clone();
                 rebuild_tree_keep(hwnd_tv, hwnd_list, st, sel);
             }
-            if st.current_folder.as_deref() == Some(key.as_str()) {
+            // Во время поиска список не подменяем выдачей папки — только статус.
+            if st.search_query.is_none()
+                && st.current_folder.as_deref() == Some(key.as_str())
+            {
                 show_folder(hwnd_list, st, &key);
             }
             match error {
@@ -643,23 +832,23 @@ pub fn apply_mail_event(
         }
         MailEvent::Seen { key, uid } => {
             if st.current_folder.as_deref() == Some(key.as_str()) {
-                if let Some(m) = st.rows.iter_mut().find(|m| m.uid == uid) {
-                    m.seen = true;
+                if let Some(m) = st.rows.iter_mut().find(|m| m.hdr.uid == uid) {
+                    m.hdr.seen = true;
                 }
                 let _ = unsafe { InvalidateRect(Some(hwnd_list), None, false) };
             }
         }
         MailEvent::Unseen { key, uid } => {
             if st.current_folder.as_deref() == Some(key.as_str()) {
-                if let Some(m) = st.rows.iter_mut().find(|m| m.uid == uid) {
-                    m.seen = false;
+                if let Some(m) = st.rows.iter_mut().find(|m| m.hdr.uid == uid) {
+                    m.hdr.seen = false;
                 }
                 let _ = unsafe { InvalidateRect(Some(hwnd_list), None, false) };
             }
         }
         MailEvent::Deleted { key, uid } => {
             if st.current_folder.as_deref() == Some(key.as_str()) {
-                st.rows.retain(|m| m.uid != uid);
+                st.rows.retain(|m| m.hdr.uid != uid);
                 unsafe {
                     SendMessageW(
                         hwnd_list,
@@ -699,6 +888,52 @@ pub fn apply_mail_event(
         MailEvent::OutboxFlushed { sent } => {
             status_text(st, &format!("очередь: отправлено писем, ждавших сети: {sent}"));
         }
+        MailEvent::SearchDone { query, hits } => {
+            // Режим поиска уже закрыт или сменился запрос — выдача устарела.
+            let Some(cur) = st.search_query.as_ref() else {
+                return;
+            };
+            if cur.as_str() != query.as_str() {
+                return;
+            }
+            let in_body = hits.iter().filter(|h| h.in_body).count();
+            st.rows = hits
+                .iter()
+                .map(|h| ListRow {
+                    hdr: MessageHeader {
+                        uid: h.uid,
+                        seq: 0,
+                        from: h.from.clone(),
+                        subject: h.subject.clone(),
+                        date: h.date.clone(),
+                        seen: h.seen,
+                        flagged: h.flagged,
+                        has_attachments: h.has_attachments,
+                        to: String::new(),
+                        cc: String::new(),
+                        msg_id: String::new(),
+                        thread_key: String::new(),
+                    },
+                    folder: Some(h.folder.clone()),
+                })
+                .collect();
+            st.selected_uid = None;
+            st.pane_body = None;
+            unsafe {
+                SendMessageW(
+                    hwnd_list,
+                    LVM_SETITEMCOUNT,
+                    Some(WPARAM(st.rows.len())),
+                    None,
+                );
+                let _ = InvalidateRect(Some(hwnd_list), None, false);
+            }
+            let n = st.rows.len();
+            status_text(
+                st,
+                &format!("поиск «{query}»: {n} писем, {in_body} совпало в теле — Esc к папке"),
+            );
+        }
         MailEvent::Status(text) => status_text(st, &text),
     }
 }
@@ -707,6 +942,7 @@ pub fn apply_mail_event(
 fn rebuild_tree_keep(hwnd_tv: HWND, hwnd_list: HWND, st: &mut AppState, sel: Option<String>) {
     rebuild_tree(hwnd_tv, st);
     if let Some(key) = sel
+        && st.search_query.is_none()
         && st.tree_slots.iter().any(|s| matches!(s, TreeSlot::Folder { key: k, .. } if *k == key))
     {
         show_folder(hwnd_list, st, &key);

@@ -1,9 +1,9 @@
 [package]
 name = "posmail-native"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
-description = "POS Mail — нативная оболочка Win32 на Rust. Фаза 1: почтовый каркас."
+description = "POS Mail — нативная оболочка Win32 на Rust. Фаза 2: паритет ядра (срез 1 — поиск)."
 
 # TASK-040 (Soroka): exe называется POSmail.exe
 [[bin]]
