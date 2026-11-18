@@ -5,36 +5,40 @@
 //! в `backend` (рабочий поток), сюда возвращаются события через WM_APP_MAIL.
 
 use windows::Win32::Foundation::{
-    E_UNEXPECTED, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    E_UNEXPECTED, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
     DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ, InvalidateRect,
-    LOGFONTW, PAINTSTRUCT, SelectObject, SetBkColor, SetTextColor,
+    LOGFONTW, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkColor, SetTextColor,
 };
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
-    CDRF_NOTIFYSUBITEMDRAW, HTREEITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT,
-    LVM_DELETECOLUMN, LVM_INSERTCOLUMNW, LVM_SETBKCOLOR, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMCOUNT, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVS_EX_DOUBLEBUFFER,
+    CDRF_NOTIFYSUBITEMDRAW, HTREEITEM, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH,
+    LVCOLUMNW, LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
+    LVM_DELETECOLUMN, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_SETBKCOLOR, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, LVS_EX_DOUBLEBUFFER,
     LVS_EX_FULLROWSELECT, NMLISTVIEW, NMLVCUSTOMDRAW, NMLVDISPINFOW, NMTREEVIEWW, TVE_EXPAND,
-    TVGN_CARET, TVI_LAST, TVI_ROOT, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0,
-    TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETBKCOLOR,
-    TVM_SETLINECOLOR, TVM_SETTEXTCOLOR, WM_MOUSELEAVE,
+    TVGN_CARET, TVHITTESTINFO, TVHT_ONITEM, TVI_LAST, TVI_ROOT, TVIF_HANDLE, TVIF_PARAM, TVIF_TEXT,
+    TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW, TVM_DELETEITEM, TVM_EXPAND, TVM_GETITEMW,
+    TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
+    TVM_SETTEXTCOLOR, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateAcceleratorTableW, CreateMenu,
-    CreatePopupMenu, DefWindowProcW, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, GWLP_USERDATA,
-    GetClientRect, GetParent, GetSystemMetrics, GetWindowLongPtrW, GetWindowPlacement,
-    GetWindowTextLengthW, GetWindowTextW, HACCEL, IDC_ARROW, IDC_SIZEWE, KillTimer, LoadCursorW,
-    MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW, RegisterClassW,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW,
-    SW_SHOWMAXIMIZED, SendMessageW, SetMenu, SetWindowLongPtrW, SetWindowPlacement, ShowWindow,
-    WINDOWPLACEMENT, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SIZE, WNDCLASSW,
+    CreatePopupMenu, DefWindowProcW, DestroyMenu, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY,
+    GWLP_USERDATA, GetClientRect, GetParent, GetSystemMetrics, GetWindowLongPtrW,
+    GetWindowPlacement, GetWindowTextLengthW, GetWindowTextW, HACCEL, HMENU, IDC_ARROW, IDC_SIZEWE,
+    KillTimer, LoadCursorW, MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW,
+    PostMessageW, RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SendMessageW, SetMenu,
+    SetWindowLongPtrW, SetWindowPlacement, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenuEx, WINDOWPLACEMENT, WM_CAPTURECHANGED, WM_COMMAND, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCPAINT, WM_NULL, WM_PAINT,
+    WM_SIZE, WNDCLASSW,
 };
 use windows::core::{Error, HSTRING, PCWSTR, w};
 
@@ -632,6 +636,11 @@ pub fn apply_theme(st: &mut AppState) {
             let _ = InvalidateRect(Some(h), None, true);
         }
     }
+    // Рамка поля поиска — палитра (TASK-N10): InvalidateRect не трогает
+    // невидимую область, перекрашиваем её явно (сабкласс ловит WM_NCPAINT).
+    unsafe {
+        let _ = SendMessageW(st.hwnd_search, WM_NCPAINT, Some(WPARAM(1)), Some(LPARAM(0)));
+    }
 }
 
 // ===== Геометрия окон (TASK-N06) =====
@@ -915,7 +924,11 @@ pub fn show_folder(hwnd_list: HWND, st: &mut AppState, key: &str) {
         .map(|s| s.load_folder(key).unwrap_or_default())
         .unwrap_or_default()
         .into_iter()
-        .map(|hdr| ListRow { hdr, folder: None })
+        .map(|hdr| ListRow {
+            hdr,
+            folder: None,
+            body_hit: false,
+        })
         .collect();
     unsafe {
         SendMessageW(
@@ -1047,9 +1060,10 @@ pub fn on_get_disp_info(st: &mut AppState, nm: &mut NMLVDISPINFOW) {
         }
         1 => row.hdr.from.clone(),
         2 => row.hdr.subject.clone(),
-        // В режиме поиска колонка 3 — папка письма; в режиме папки — дата.
+        // В режиме поиска колонка 3 — папка письма (+ маркер «в теле»,
+        // TASK-N10); в режиме папки — дата.
         3 => match &row.folder {
-            Some(key) => folder_display(&split_key(key).1),
+            Some(key) => folder_cell(&folder_display(&split_key(key).1), row.body_hit),
             None => list_date(&row.hdr.date),
         },
         _ => list_date(&row.hdr.date),
@@ -1101,16 +1115,25 @@ fn full_date(raw: &str) -> String {
     }
 }
 
+/// Текст колонки «Папка» в режиме поиска (TASK-N10): у совпадений
+/// только в теле письма — маркер «· в теле» (порт body-hit Сороки,
+/// там строка помечается классом с отдельной группой списка).
+pub fn folder_cell(name: &str, body_hit: bool) -> String {
+    if body_hit {
+        format!("{name} · в теле")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Ответ NM_CUSTOMDRAW списка: непрочитанные — полужирным, цвета —
-/// палитра темы (TASK-N05). На каждый ITEMPREPAINT (включая сабайтемы)
-/// выбираем нужный шрифт и цвет заново.
+/// палитра темы (TASK-N05); выделенная строка — фон палитры
+/// accent-weak-2 вместо системного синего (TASK-N10, как .m-row.selected
+/// в Soroka; акцентную полосу слева GDI-строкой не повторить). На каждый
+/// ITEMPREPAINT (включая сабайтемы) выбираем нужный шрифт и цвет заново.
 ///
 /// lv — сырой указатель уведомления: список присылает NMLVCUSTOMDRAW
 /// (расширение NMCUSTOMDRAW), цвета меняются в нём же.
-///
-/// Выделенная строка красится системой (синий + белый, как у дерева —
-/// контрол делает это сам): палитру в выделение не вмешиваем; owner-draw
-/// строки — отдельная задача N10, если понадобится.
 pub fn on_list_custom_draw(st: &AppState, lv: *mut NMLVCUSTOMDRAW) -> LRESULT {
     let (stage, item, state, hdc) = unsafe {
         let nm = &(*lv).nmcd;
@@ -1124,11 +1147,15 @@ pub fn on_list_custom_draw(st: &AppState, lv: *mut NMLVCUSTOMDRAW) -> LRESULT {
             unsafe {
                 SelectObject(hdc, HGDIOBJ(hfont.0));
             }
-            if (state & CDIS_SELECTED).0 == 0 {
+            let lv = unsafe { &mut *lv };
+            let p = theme::palette(st.dark);
+            if (state & CDIS_SELECTED).0 != 0 {
+                // Выделение — палитра Soroka, не системный синий (TASK-N10).
+                lv.clrText = p.text;
+                lv.clrTextBk = p.selected;
+            } else {
                 // Свободная строка: колонка даты — вторичным цветом,
                 // остальное — основным (цвета темы).
-                let lv = unsafe { &mut *lv };
-                let p = theme::palette(st.dark);
                 let date_col: i32 = if st.search_query.is_some() { 4 } else { 3 };
                 lv.clrText = if lv.iSubItem == date_col {
                     p.text_dim
@@ -1454,6 +1481,7 @@ pub fn apply_mail_event(
                         thread_key: String::new(),
                     },
                     folder: Some(h.folder.clone()),
+                    body_hit: h.in_body,
                 })
                 .collect();
             st.selected_uid = None;
@@ -1488,5 +1516,186 @@ fn rebuild_tree_keep(hwnd_tv: HWND, hwnd_list: HWND, st: &mut AppState, sel: Opt
             .any(|s| matches!(s, TreeSlot::Folder { key: k, .. } if *k == key))
     {
         show_folder(hwnd_list, st, &key);
+    }
+}
+
+// ===== Контекстные меню (TASK-N10) =====
+
+/// Экранные координаты → координаты клиента окна.
+fn screen_to_client(hwnd: HWND, x: i32, y: i32) -> POINT {
+    let mut pt = POINT { x, y };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+    pt
+}
+
+/// Пункт всплывающего меню.
+unsafe fn menu_add(menu: HMENU, id: usize, text: &str) {
+    let mut label = wide(text);
+    unsafe {
+        let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(label.as_mut_ptr()));
+    }
+}
+
+/// Показать меню и вернуть выбранную команду (0 — закрыли без выбора).
+/// SetForegroundWindow до и WM_NULL после — классика KB135788 (как трей).
+unsafe fn popup_menu(hwnd: HWND, menu: HMENU, x: i32, y: i32) -> usize {
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, x, y, hwnd, None);
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        cmd.0 as usize
+    }
+}
+
+/// Контекстное меню строки списка (TASK-N10, порт openMsgMenu Сороки:
+/// действия над письмом под курсором). Правый клик сначала выделяет строку
+/// (как в Проводнике) — LVN_ITEMCHANGED открывает письмо, команды меню
+/// работают с selected_uid. Состав: ответ/ответ всем/пересылка (у Сороки
+/// их в меню нет, здесь команды главного меню уже существовали — ежедневные
+/// операции без походов в меню), прочитано/непрочитано (склоняется, как в
+/// Сороке), в корзину. Спам-пункта нет — спама в оболочке нет.
+pub fn track_list_menu(hwnd_main: HWND, hwnd_list: HWND, x: i32, y: i32, st: &AppState) {
+    let info = LVHITTESTINFO {
+        pt: screen_to_client(hwnd_list, x, y),
+        ..Default::default()
+    };
+    let idx = unsafe {
+        SendMessageW(
+            hwnd_list,
+            LVM_HITTEST,
+            Some(WPARAM(0)),
+            Some(LPARAM(&info as *const LVHITTESTINFO as isize)),
+        )
+    }
+    .0 as i32;
+    if idx < 0 {
+        return;
+    }
+    let Some(row) = st.rows.get(idx as usize) else {
+        return;
+    };
+    let seen = row.hdr.seen;
+    // Выделить строку под курсором (виртуальный список хранит состояние
+    // выбора сам — LVN_GETDISPINFO отдаёт только текст).
+    let sel_focus = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+    let mut item = LVITEMW {
+        mask: LVIF_STATE,
+        iItem: idx,
+        state: sel_focus,
+        stateMask: sel_focus,
+        ..Default::default()
+    };
+    unsafe {
+        SendMessageW(
+            hwnd_list,
+            LVM_SETITEMSTATE,
+            Some(WPARAM(idx as usize)),
+            Some(LPARAM(&mut item as *mut LVITEMW as isize)),
+        );
+    }
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        menu_add(menu, IDM_REPLY as usize, "Ответить");
+        menu_add(menu, IDM_REPLY_ALL as usize, "Ответить всем");
+        menu_add(menu, IDM_FORWARD as usize, "Переслать");
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        menu_add(
+            menu,
+            IDM_TOGGLE_SEEN as usize,
+            if seen {
+                "Непрочитано"
+            } else {
+                "Прочитано"
+            },
+        );
+        menu_add(menu, IDM_DELETE as usize, "В корзину");
+        let cmd = popup_menu(hwnd_main, menu, x, y);
+        let _ = DestroyMenu(menu);
+        if cmd != 0 {
+            // Тот же путь, что и выбор из главного меню: lparam = 0.
+            let _ = PostMessageW(Some(hwnd_main), WM_COMMAND, WPARAM(cmd), LPARAM(0));
+        }
+    }
+}
+
+/// Контекстное меню дерева (TASK-N10): на папке — «Проверить папку»
+/// (у Сороки меню дерева нет; добавлено по PLAN-ZAI N10 — ежедневные
+/// операции без походов в меню). Правый клик выбирает узел — TVN_SELCHANGED
+/// подгружает папку, синхронизируется уже она.
+pub fn track_tree_menu(hwnd_main: HWND, hwnd_tree: HWND, x: i32, y: i32, st: &AppState) {
+    let mut hit = TVHITTESTINFO {
+        pt: screen_to_client(hwnd_tree, x, y),
+        ..Default::default()
+    };
+    let hitem = HTREEITEM(
+        unsafe {
+            SendMessageW(
+                hwnd_tree,
+                TVM_HITTEST,
+                Some(WPARAM(0)),
+                Some(LPARAM(&mut hit as *mut TVHITTESTINFO as isize)),
+            )
+        }
+        .0,
+    );
+    if hitem.0 == 0 || (hit.flags.0 & TVHT_ONITEM.0) == 0 {
+        return;
+    }
+    // Слот узла (lParam при вставке) — папка или заголовок ящика.
+    let mut item = TVITEMW {
+        mask: TVIF_HANDLE | TVIF_PARAM,
+        hItem: hitem,
+        ..Default::default()
+    };
+    unsafe {
+        SendMessageW(
+            hwnd_tree,
+            TVM_GETITEMW,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut item as *mut TVITEMW as isize)),
+        );
+    }
+    if !matches!(
+        st.tree_slots.get(item.lParam.0 as usize),
+        Some(TreeSlot::Folder { .. })
+    ) {
+        return;
+    }
+    unsafe {
+        SendMessageW(
+            hwnd_tree,
+            TVM_SELECTITEM,
+            Some(WPARAM(TVGN_CARET as usize)),
+            Some(LPARAM(hitem.0)),
+        );
+    }
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        menu_add(menu, IDM_SYNC as usize, "Проверить папку");
+        let cmd = popup_menu(hwnd_main, menu, x, y);
+        let _ = DestroyMenu(menu);
+        if cmd != 0 {
+            let _ = PostMessageW(Some(hwnd_main), WM_COMMAND, WPARAM(cmd), LPARAM(0));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::folder_cell;
+
+    #[test]
+    fn folder_cell_marks_body_hits() {
+        // Обычное совпадение — только имя папки.
+        assert_eq!(folder_cell("Входящие", false), "Входящие");
+        assert_eq!(folder_cell("Черновики", false), "Черновики");
+        // Совпадение только в теле — маркер (TASK-N10).
+        assert_eq!(folder_cell("Входящие", true), "Входящие · в теле");
     }
 }

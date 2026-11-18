@@ -30,8 +30,11 @@ pub struct Palette {
     pub text_dim: COLORREF,
     /// Границы, линия сплиттера — `--stroke`.
     pub stroke: COLORREF,
-    /// Акцент: хват сплиттера при наведении/жесте — `--accent`.
+    /// Акцент: хват сплиттера при наведении/жесте, рамка поиска в фокусе — `--accent`.
     pub accent: COLORREF,
+    /// Фон выделенной строки списка — `--accent-weak-2` поверх bg-app
+    /// (TASK-N10; вместо системного синего).
+    pub selected: COLORREF,
 
     // HTML-цвета панели письма (WebView2): значения из той же палитры.
     pub pane_bg: &'static str,
@@ -51,6 +54,8 @@ pub const DARK: Palette = Palette {
     text_dim: rgb(0xA9, 0xAA, 0xAC), // text2: белый .62 поверх bg-app
     stroke: rgb(0x32, 0x33, 0x39),   // stroke: белый .095 поверх bg-app
     accent: rgb(0x8B, 0x83, 0xFF),   // --accent
+    // accent-weak-2 rgba(139,131,255,.24) поверх bg-app.
+    selected: rgb(0x37, 0x36, 0x59),
 
     pane_bg: "#1c1e24",
     pane_hdr: "#24262c", // --panel: белый .035 поверх bg-app
@@ -69,6 +74,9 @@ pub const LIGHT: Palette = Palette {
     text_dim: rgb(0x5F, 0x66, 0x72),
     stroke: rgb(0xDF, 0xE3, 0xEA),
     accent: rgb(0x5B, 0x50, 0xD9), // акцент Soroka, затемнён для белого фона
+    // Светлая секция styles.css: accent-weak-2 rgba(79,70,229,.14)
+    // поверх нашего фона.
+    selected: rgb(0xDF, 0xDE, 0xF6),
 
     pane_bg: "#ffffff",
     pane_hdr: "#f6f7f9",

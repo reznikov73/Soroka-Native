@@ -58,8 +58,8 @@ use windows::Win32::Foundation::{
     E_POINTER, E_UNEXPECTED, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HDC, HGDIOBJ, PAINTSTRUCT,
-    SetBkColor, SetTextColor,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, FrameRect, GetWindowDC, HDC,
+    HGDIOBJ, PAINTSTRUCT, ReleaseDC, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -77,18 +77,18 @@ use windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK;
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CallWindowProcW,
     CheckMenuItem, CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyIcon, DestroyWindow,
-    DispatchMessageW, EndDeferWindowPos, ES_AUTOHSCROLL, GA_ROOT, GWLP_USERDATA, GWLP_WNDPROC,
-    GetAncestor, GetClientRect, GetForegroundWindow, GetMenu, GetMessageW, GetParent,
-    GetWindowLongPtrW, IDC_ARROW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW,
+    DispatchMessageW, ES_AUTOHSCROLL, EndDeferWindowPos, GA_ROOT, GWLP_USERDATA, GWLP_WNDPROC,
+    GetAncestor, GetClientRect, GetCursorPos, GetForegroundWindow, GetMenu, GetMessageW, GetParent,
+    GetWindowLongPtrW, GetWindowRect, IDC_ARROW, IsIconic, IsWindowVisible, KillTimer, LoadCursorW,
     MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_BYCOMMAND, MF_CHECKED, MF_UNCHECKED, MINMAXINFO, MSG,
     MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
     SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOZORDER, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateAcceleratorW, TranslateMessage, WS_EX_COMPOSITED, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NOTIFY,
-    WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE,
+    WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT, WM_NOTIFY,
+    WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC,
+    WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_COMPOSITED, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
@@ -110,7 +110,7 @@ use ui::{
     create_menu, empty_pane_html, enter_search, exit_search, fire_search, letter_html,
     on_get_disp_info, on_list_custom_draw, on_list_item_changed, on_tree_select, rebuild_tree,
     register_splitter_class, register_status_class, restore_placement, setup_list_columns,
-    snapshot_placement, status_text,
+    snapshot_placement, status_text, track_list_menu, track_tree_menu,
 };
 
 const WINDOW_CLASS: PCWSTR = w!("SorokaNativeWnd");
@@ -168,7 +168,13 @@ unsafe fn layout(hwnd: HWND, st: &mut AppState) {
     if search_open && !st.hwnd_search.0.is_null() {
         entries.push((st.hwnd_search, x_list, 2, list_px, SEARCH_H - 4));
     }
-    entries.push((st.hwnd_list, x_list, list_top, list_px, (h_main - list_top).max(0)));
+    entries.push((
+        st.hwnd_list,
+        x_list,
+        list_top,
+        list_px,
+        (h_main - list_top).max(0),
+    ));
     entries.push((st.hwnd_split_tree, x_split_tree, 0, SPLIT_W, h_main));
     entries.push((st.hwnd_split_pane, x_split_pane, 0, SPLIT_W, h_main));
     if !st.hwnd_status.0.is_null() && h > STATUS_H {
@@ -466,11 +472,72 @@ unsafe extern "system" fn search_edit_proc(
                 return LRESULT(0);
             }
         }
+        WM_NCPAINT => {
+            // Рамка поля поиска — палитра вместо системного 3D-контура
+            // (TASK-N10); место под рамку оставляет WS_EX_CLIENTEDGE.
+            unsafe { paint_search_frame(hwnd) };
+            return LRESULT(0);
+        }
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            // Фокус меняет цвет рамки (штрих ↔ акцент) — перекрасить,
+            // дальше обычная обработка фокуса.
+            unsafe { paint_search_frame(hwnd) };
+        }
         _ => {}
     }
     let orig = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
     let proc: WNDPROC = unsafe { std::mem::transmute::<isize, WNDPROC>(orig) };
     unsafe { CallWindowProcW(proc, hwnd, msg, wparam, lparam) }
+}
+
+/// Рамка поля поиска из палитры (TASK-N10): на месте системного 3D-контура
+/// WS_EX_CLIENTEDGE — плоская линия, обычная (--stroke) или акцентная в
+/// фокусе (--accent), как .tb-search в Soroka. Вызывается из WM_NCPAINT
+/// сабкласса и при смене темы (apply_theme шлёт WM_NCPAINT полю).
+unsafe fn paint_search_frame(hwnd: HWND) {
+    unsafe {
+        let parent = GetParent(hwnd).unwrap_or_default();
+        if parent.is_invalid() {
+            return;
+        }
+        let st = &*(GetWindowLongPtrW(parent, GWLP_USERDATA) as *const AppState);
+        let p = theme::palette(st.dark);
+        let color = if GetFocus() == hwnd {
+            p.accent
+        } else {
+            p.stroke
+        };
+        let hdc = GetWindowDC(Some(hwnd));
+        let mut wr = RECT::default();
+        if GetWindowRect(hwnd, &mut wr).is_ok() {
+            let w = wr.right - wr.left;
+            let h = wr.bottom - wr.top;
+            let br = CreateSolidBrush(color);
+            // CLIENTEDGE оставляет 2px — закрашиваем обе линии плоско.
+            let _ = FrameRect(
+                hdc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+                br,
+            );
+            let _ = FrameRect(
+                hdc,
+                &RECT {
+                    left: 1,
+                    top: 1,
+                    right: w - 1,
+                    bottom: h - 1,
+                },
+                br,
+            );
+            let _ = DeleteObject(HGDIOBJ(br.0));
+        }
+        let _ = ReleaseDC(Some(hwnd), hdc);
+    }
 }
 
 /// Применить тему (TASK-N05; с N09 хранится в settings.json — native_theme).
@@ -830,6 +897,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 _ => {}
             }
             LRESULT(0)
+        }
+        WM_CONTEXTMENU => {
+            // Контекстные меню (TASK-N10): список — действия над письмом
+            // под курсором, дерево — «Проверить папку». lparam — экранные
+            // координаты; -1 — меню с клавиатуры (Shift+F10), берём курсор.
+            let target = HWND(wparam.0 as *mut core::ffi::c_void);
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            let (x, y) = if lparam.0 == -1 {
+                let mut pt = POINT::default();
+                if unsafe { GetCursorPos(&mut pt) }.is_err() {
+                    return LRESULT(0);
+                }
+                (pt.x, pt.y)
+            } else {
+                // Знаковые координаты (могут быть отрицательны на многомониторе).
+                (
+                    (lparam.0 & 0xFFFF) as u16 as i16 as i32,
+                    ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32,
+                )
+            };
+            if target == st.hwnd_list {
+                track_list_menu(hwnd, st.hwnd_list, x, y, st);
+                return LRESULT(0);
+            }
+            if target == st.hwnd_tree {
+                track_tree_menu(hwnd, st.hwnd_tree, x, y, st);
+                return LRESULT(0);
+            }
+            // Прочее (фон, заголовок окна) — системное поведение:
+            // DefWindowProc покажет меню окна у заголовка.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_NOTIFY => {
             let hdr = unsafe { &*(lparam.0 as *const NMHDR) };
@@ -1275,8 +1373,12 @@ fn run() -> Result<()> {
         SendMessageW(
             st.hwnd_tree,
             windows::Win32::UI::Controls::TVM_SETEXTENDEDSTYLE,
-            Some(WPARAM(windows::Win32::UI::Controls::TVS_EX_DOUBLEBUFFER as usize)),
-            Some(LPARAM(windows::Win32::UI::Controls::TVS_EX_DOUBLEBUFFER as isize)),
+            Some(WPARAM(
+                windows::Win32::UI::Controls::TVS_EX_DOUBLEBUFFER as usize,
+            )),
+            Some(LPARAM(
+                windows::Win32::UI::Controls::TVS_EX_DOUBLEBUFFER as isize,
+            )),
         );
     }
 

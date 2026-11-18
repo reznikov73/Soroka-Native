@@ -25,11 +25,13 @@ pub enum TreeSlot {
 
 /// Строка списка: заголовок письма + папка, если строка из результатов поиска
 /// (TASK-N03). В режиме папки folder = None — строка относится к current_folder,
-/// в режиме поиска — Some(«id::ПАПКА») у каждой строки своя.
+/// в режиме поиска — Some(«id::ПАПКА») у каждой строки своя. body_hit — совпадение
+/// только в теле письма (маркер в колонке «Папка», TASK-N10).
 #[derive(Debug, Clone)]
 pub struct ListRow {
     pub hdr: MessageHeader,
     pub folder: Option<String>,
+    pub body_hit: bool,
 }
 
 /// Тело текущего письма (для показа и цитирования при ответе).
