@@ -8,9 +8,10 @@ use windows::Win32::Foundation::{
     E_UNEXPECTED, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ, InvalidateRect,
-    LOGFONTW, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkColor, SetTextColor,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
+    CreateSolidBrush, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+    DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ, InvalidateRect, LOGFONTW,
+    PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject, SetBkColor, SetTextColor,
 };
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
@@ -362,34 +363,54 @@ unsafe extern "system" fn splitter_proc(
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             let mut rc = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut rc) };
-            // Палитра темы (TASK-N05): фон — как у панелей, хват — штрих,
-            // при наведении/жесте — акцент Soroka (вместо системных цветов,
-            // долг из TASK-N04).
-            let st = unsafe { &*(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *const AppState) };
-            let p = theme::palette(st.dark);
-            let bg = unsafe { CreateSolidBrush(p.bg) };
-            unsafe { FillRect(hdc, &rc, bg) };
-            // Полоса-хват 3×36px по центру — как .splitter-v::after в Soroka.
-            let cx = (rc.left + rc.right) / 2;
-            let cy = (rc.top + rc.bottom) / 2;
-            let line = RECT {
-                left: cx - 1,
-                top: cy - 18,
-                right: cx + 2,
-                bottom: cy + 18,
-            };
-            let grip_color = if ctx.hover || ctx.captured {
-                p.accent
-            } else {
-                p.stroke
-            };
-            let grip = unsafe { CreateSolidBrush(grip_color) };
-            unsafe { FillRect(hdc, &line, grip) };
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(bg.0));
-                let _ = DeleteObject(HGDIOBJ(grip.0));
-                let _ = EndPaint(hwnd, &ps);
+            let cw = rc.right - rc.left;
+            let ch = rc.bottom - rc.top;
+            if cw > 0 && ch > 0 {
+                // Палитра темы (TASK-N05): фон — как у панелей, хват — штрих,
+                // при наведении/жесте — акцент Soroka (вместо системных цветов,
+                // долг из TASK-N04).
+                let st =
+                    unsafe { &*(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *const AppState) };
+                let p = theme::palette(st.dark);
+                let bg = unsafe { CreateSolidBrush(p.bg) };
+                let grip = unsafe {
+                    CreateSolidBrush(if ctx.hover || ctx.captured {
+                        p.accent
+                    } else {
+                        p.stroke
+                    })
+                };
+                // Буферный кадр (раунд 3, TASK-N04): сплиттер перекладывается
+                // на каждый тик drag, и рисование прямо в экранный DC
+                // мелькало промежуточным «фон без хвата». Кадр собирается
+                // в памяти и вываливается одним BitBlt.
+                let mem = unsafe { CreateCompatibleDC(Some(hdc)) };
+                let bmp = unsafe { CreateCompatibleBitmap(hdc, cw, ch) };
+                let old = unsafe { SelectObject(mem, HGDIOBJ(bmp.0)) };
+                unsafe {
+                    FillRect(mem, &rc, bg);
+                    // Полоса-хват 3×36px по центру — как .splitter-v::after.
+                    let cx = (rc.left + rc.right) / 2;
+                    let cy = (rc.top + rc.bottom) / 2;
+                    FillRect(
+                        mem,
+                        &RECT {
+                            left: cx - 1,
+                            top: cy - 18,
+                            right: cx + 2,
+                            bottom: cy + 18,
+                        },
+                        grip,
+                    );
+                    let _ = BitBlt(hdc, 0, 0, cw, ch, Some(mem), 0, 0, SRCCOPY);
+                    SelectObject(mem, old);
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    let _ = DeleteDC(mem);
+                    let _ = DeleteObject(HGDIOBJ(bg.0));
+                    let _ = DeleteObject(HGDIOBJ(grip.0));
+                }
             }
+            let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -452,6 +473,10 @@ unsafe extern "system" fn splitter_proc(
             // До первого движения применится «нулевой» сдвиг — веса не меняются.
             ctx.last_x = ctx.start_x;
             let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
+            // Жест начинается здесь, а не первым тиком сглаживания
+            // (раунд 3, TASK-N04): в окне до 15 мс layout() ещё мог
+            // трогать bounds WebView2.
+            st.dragging = true;
             if ctx.pane {
                 ctx.start_a_px = st.list_px;
                 ctx.sum_px = st.list_px + st.pane_px;
@@ -580,39 +605,53 @@ unsafe extern "system" fn status_proc(
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             let mut rc = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut rc) };
-            // Палитра и шрифт — из AppState родителя (главного окна).
-            let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
-            let st = unsafe { &*(GetWindowLongPtrW(parent, GWLP_USERDATA) as *const AppState) };
-            let p = theme::palette(st.dark);
-            let bg = unsafe { CreateSolidBrush(p.bg) };
-            let stroke = unsafe { CreateSolidBrush(p.stroke) };
-            unsafe {
-                FillRect(hdc, &rc, bg);
-                // Верхняя граница — линия штриха палитры.
-                FillRect(hdc, &RECT { bottom: 1, ..rc }, stroke);
-                // Текст: вторичным цветом (статус — не главный контент).
-                let len = GetWindowTextLengthW(hwnd).max(0) as usize;
-                let mut buf = vec![0u16; len + 1];
-                let got = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
-                if got > 0 {
-                    let old = SelectObject(hdc, HGDIOBJ(st.font.0));
-                    SetTextColor(hdc, p.text_dim);
-                    SetBkColor(hdc, p.bg);
-                    let mut trc = rc;
-                    trc.left += 8;
-                    trc.top += 1;
-                    let _ = DrawTextW(
-                        hdc,
-                        &mut buf[..got],
-                        &mut trc,
-                        DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
-                    );
-                    SelectObject(hdc, old);
+            let cw = rc.right - rc.left;
+            let ch = rc.bottom - rc.top;
+            if cw > 0 && ch > 0 {
+                // Палитра и шрифт — из AppState родителя (главного окна).
+                let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+                let st = unsafe { &*(GetWindowLongPtrW(parent, GWLP_USERDATA) as *const AppState) };
+                let p = theme::palette(st.dark);
+                let bg = unsafe { CreateSolidBrush(p.bg) };
+                let stroke = unsafe { CreateSolidBrush(p.stroke) };
+                // Буферный кадр (раунд 3, TASK-N04): статус-бар перекладывается
+                // при каждом ресайзе, прямой экранной отрисовки достаточно
+                // чтобы мелькнуть — собираем кадр в памяти, одним BitBlt.
+                let mem = unsafe { CreateCompatibleDC(Some(hdc)) };
+                let bmp = unsafe { CreateCompatibleBitmap(hdc, cw, ch) };
+                let old = unsafe { SelectObject(mem, HGDIOBJ(bmp.0)) };
+                unsafe {
+                    FillRect(mem, &rc, bg);
+                    // Верхняя граница — линия штриха палитры.
+                    FillRect(mem, &RECT { bottom: 1, ..rc }, stroke);
+                    // Текст: вторичным цветом (статус — не главный контент).
+                    let len = GetWindowTextLengthW(hwnd).max(0) as usize;
+                    let mut buf = vec![0u16; len + 1];
+                    let got = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
+                    if got > 0 {
+                        let fold = SelectObject(mem, HGDIOBJ(st.font.0));
+                        SetTextColor(mem, p.text_dim);
+                        SetBkColor(mem, p.bg);
+                        let mut trc = rc;
+                        trc.left += 8;
+                        trc.top += 1;
+                        let _ = DrawTextW(
+                            mem,
+                            &mut buf[..got],
+                            &mut trc,
+                            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+                        );
+                        SelectObject(mem, fold);
+                    }
+                    let _ = BitBlt(hdc, 0, 0, cw, ch, Some(mem), 0, 0, SRCCOPY);
+                    SelectObject(mem, old);
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    let _ = DeleteDC(mem);
+                    let _ = DeleteObject(HGDIOBJ(bg.0));
+                    let _ = DeleteObject(HGDIOBJ(stroke.0));
                 }
-                let _ = DeleteObject(HGDIOBJ(bg.0));
-                let _ = DeleteObject(HGDIOBJ(stroke.0));
-                let _ = EndPaint(hwnd, &ps);
             }
+            let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },

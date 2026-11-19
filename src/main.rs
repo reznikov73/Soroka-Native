@@ -88,7 +88,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO,
     WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCPAINT, WM_NOTIFY,
     WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 
@@ -1283,13 +1283,16 @@ fn run() -> Result<()> {
     let st = unsafe { &mut *state };
 
     // --- дети: дерево, список, статус-бар ---
+    // WS_CLIPSIBLINGS (раунд 3, TASK-N04): при DeferWindowPos-батче дети
+    // на миг перекрываются — без клиппинга соседей перерисовывающийся
+    // ребёнок рисует поверх другого (вспышки вдоль движущейся границы).
     let child = |class: PCWSTR, style_extra: WINDOW_STYLE| -> Result<HWND> {
         unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 class,
                 None,
-                WS_CHILD | WS_VISIBLE | style_extra,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | style_extra,
                 0,
                 0,
                 100,
@@ -1314,7 +1317,7 @@ fn run() -> Result<()> {
             WS_EX_CLIENTEDGE,
             w!("EDIT"),
             None,
-            WS_CHILD | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+            WS_CHILD | WS_CLIPSIBLINGS | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
             0,
             2,
             400,
@@ -1359,7 +1362,7 @@ fn run() -> Result<()> {
             WINDOW_EX_STYLE(0),
             w!("SorokaNativeSplitter"),
             None,
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
             0,
             0,
             SPLIT_W,
@@ -1375,7 +1378,7 @@ fn run() -> Result<()> {
             WINDOW_EX_STYLE(0),
             w!("SorokaNativeSplitter"),
             None,
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
             0,
             0,
             SPLIT_W,

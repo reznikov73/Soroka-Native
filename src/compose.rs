@@ -19,15 +19,15 @@ use windows::Win32::UI::Controls::Dialogs::{
 use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, BN_CLICKED, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-    DefWindowProcW, DeferWindowPos, DestroyWindow, EndDeferWindowPos, ES_AUTOHSCROLL,
-    ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW,
-    IDC_ARROW, KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LBS_NOTIFY,
-    LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_YESNO, MessageBoxW, MINMAXINFO,
-    RegisterClassW, SetTimer, SWP_NOZORDER, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_NCCREATE, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD,
-    WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    BN_CLICKED, BeginDeferWindowPos, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
+    DefWindowProcW, DeferWindowPos, DestroyWindow, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
+    ES_WANTRETURN, EndDeferWindowPos, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_ARROW,
+    KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LBS_NOTIFY, LoadCursorW, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_OK, MB_YESNO, MINMAXINFO, MessageBoxW, RegisterClassW, SWP_NOZORDER,
+    SetTimer, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_NCCREATE, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
@@ -274,7 +274,10 @@ unsafe fn child(
             WINDOW_EX_STYLE(0),
             class,
             text_ptr,
-            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | style),
+            // WS_CLIPSIBLINGS (раунд 3, TASK-N04): батч-переложение девяти
+            // детей — без клиппинга соседей перекрывающиеся на миг контролы
+            // рисуют поверх друг друга.
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | style),
             x,
             y,
             w,
@@ -358,9 +361,8 @@ unsafe fn layout(hwnd: HWND, st: &ComposeState) {
         match BeginDeferWindowPos(entries.len() as i32) {
             Ok(mut wpos) => {
                 for (h2, x, y, cx, cy) in &entries {
-                    wpos =
-                        DeferWindowPos(wpos, *h2, None, *x, *y, *cx, *cy, SWP_NOZORDER)
-                            .unwrap_or(wpos);
+                    wpos = DeferWindowPos(wpos, *h2, None, *x, *y, *cx, *cy, SWP_NOZORDER)
+                        .unwrap_or(wpos);
                 }
                 let _ = EndDeferWindowPos(wpos);
             }
