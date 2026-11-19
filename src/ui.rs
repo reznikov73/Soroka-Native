@@ -35,11 +35,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowPlacement, GetWindowTextLengthW, GetWindowTextW, HACCEL, HMENU, IDC_ARROW, IDC_SIZEWE,
     KillTimer, LoadCursorW, MENU_ITEM_FLAGS, MF_POPUP, MF_SEPARATOR, MF_STRING, NONCLIENTMETRICSW,
     PostMessageW, RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SendMessageW, SetMenu, SetTimer,
-    SetWindowLongPtrW, SetWindowPlacement, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenuEx, WINDOWPLACEMENT, WM_CAPTURECHANGED, WM_COMMAND, WM_ERASEBKGND,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCPAINT, WM_NULL,
-    WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW,
+    SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SendMessageW, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPlacement,
+    SetWindowPos, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOWPLACEMENT,
+    WM_CAPTURECHANGED, WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCPAINT, WM_NULL, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW,
 };
 use windows::core::{Error, HSTRING, PCWSTR, w};
 
@@ -332,11 +332,13 @@ pub fn register_splitter_class(hmod: HMODULE) -> windows::core::Result<()> {
     Ok(())
 }
 
-/// Оконная процедура сплиттера: перетаскивание меняет веса соседних панелей
-/// (математика dragSplit из Soroka — сумма весов пары сохраняется, минимум
-/// панели 110px) и шлёт главному окну WM_SIZE: дерево и список переложиваются
-/// сразу. Bounds панели письма обновляются после жеста (layout() при
-/// st.dragging == false).
+/// Оконная процедура сплиттера — резиновая полоса (раунд 4, TASK-N04):
+/// в жесте меняется только x самой полосы (веса пары пересчитываются на
+/// лету, математика dragSplit из Soroka — сумма весов сохраняется, минимум
+/// панели 110px), дерево и список не перекладываются и не перерисовываются
+/// вовсе. Единственная раскладка жеста — WM_SIZE главному окну по
+/// отпусканию: дети и панель письма встают на новые места одним батчем
+/// (layout() при st.dragging == false).
 unsafe extern "system" fn splitter_proc(
     hwnd: HWND,
     msg: u32,
@@ -445,12 +447,13 @@ unsafe extern "system" fn splitter_proc(
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == IDT_SPLIT_DRAG => {
-            // Тик сглаживания (TASK-N04.3): применяем веса по последнему x.
+            // Тик сглаживания (TASK-N04.3): двигаем полосу к последнему x
+            // мыши (только окно полосы — панели не трогаем, раунд 4).
             let _ = unsafe { KillTimer(Some(hwnd), IDT_SPLIT_DRAG) };
             if let Some(ctx) = ctx {
                 ctx.timer_armed = false;
                 if ctx.captured {
-                    unsafe { apply_drag(ctx) };
+                    unsafe { apply_drag(hwnd, ctx) };
                 }
             }
             LRESULT(0)
@@ -506,7 +509,7 @@ unsafe extern "system" fn splitter_proc(
                 // последний x мыши не должен теряться на отпускании.
                 let _ = unsafe { KillTimer(Some(hwnd), IDT_SPLIT_DRAG) };
                 ctx.timer_armed = false;
-                unsafe { apply_drag(ctx) };
+                unsafe { apply_drag(hwnd, ctx) };
                 let st =
                     unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
                 st.dragging = false;
@@ -515,7 +518,8 @@ unsafe extern "system" fn splitter_proc(
                 {
                     let _ = unsafe { ctrl.SetIsVisible(true) };
                 }
-                // Финальная раскладка: панель письма получает новые bounds.
+                // Единственная раскладка жеста (раунд 4): один WM_SIZE — дети
+                // и панель письма встают на новые места одним батчем.
                 let _ =
                     unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
                 layout_store::save(st.wf, st.wl, st.wr);
@@ -544,23 +548,47 @@ unsafe extern "system" fn splitter_proc(
     }
 }
 
-/// Применить веса панелей по ctx.last_x и переложить детей (математика
-/// dragSplit из Soroka: сумма весов пары сохраняется, минимум панели
-/// 110px). Вызывается тиком сглаживания при drag и отпусканием мыши —
-/// не каждым WM_MOUSEMOVE (TASK-N04.3).
-unsafe fn apply_drag(ctx: &mut SplitCtx) {
+/// Применить позицию по ctx.last_x — раунд 4 (резиновая полоса, TASK-N04):
+/// в жесте двигается ТОЛЬКО сама полоса — SetWindowPos одного окна 6px с
+/// SWP_NOSIZE (высота не трогается), WM_SIZE главному окну не шлётся:
+/// дерево и список не получают ресайза, не инвалидируют клиент и не
+/// перерисовываются вовсе (в live-drag список на каждом тике инвалидировал
+/// ВЕСЬ клиент — LVN_GETDISPINFOW + NM_CUSTOMDRAW на каждую видимую строку,
+/// ~66 полных перерисовок в секунду). Обнажившаяся за полосой 6px-полоса
+/// докрашивается соседями — клип ограничен, копеечно.
+///
+/// Веса пары пересчитываются на лету (сумма сохраняется, минимум 110px),
+/// чтобы внешний WM_SIZE во время жеста (снап Win+стрелки) видел актуальные
+/// пропорции. Единственная раскладка — WM_SIZE по отпусканию
+/// (splitter_proc, WM_LBUTTONUP). Флаг st.dragging здесь не трогаем:
+/// он принадлежит WM_LBUTTONDOWN/WM_LBUTTONUP (с v0.3.12).
+unsafe fn apply_drag(hwnd: HWND, ctx: &mut SplitCtx) {
     let st = unsafe { &mut *(GetWindowLongPtrW(ctx.main, GWLP_USERDATA) as *mut AppState) };
     let pa = (ctx.start_a_px + (ctx.last_x - ctx.start_x)).clamp(PANE_MIN, ctx.sum_px - PANE_MIN);
     let wa = ctx.sum_w * pa as f64 / ctx.sum_px as f64;
-    if ctx.pane {
+    // Дерево в жесте не двигается: st.tree_px актуален с последней layout().
+    let x = if ctx.pane {
+        // Полоса «список|тело»: левый край списка + новая ширина списка.
         st.wl = wa;
         st.wr = ctx.sum_w - wa;
+        st.tree_px + SPLIT_W + pa
     } else {
+        // Полоса «дерево|список»: новая ширина дерева.
         st.wf = wa;
         st.wl = ctx.sum_w - wa;
-    }
-    st.dragging = true;
-    let _ = unsafe { SendMessageW(ctx.main, WM_SIZE, Some(WPARAM(0)), Some(LPARAM(0))) };
+        pa
+    };
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            x,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    };
 }
 
 // ===== Статус-бар (TASK-N05) =====
