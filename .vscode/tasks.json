@@ -1,0 +1,106 @@
+{
+  "version": "2.0.0",
+  // ============================================================
+  // ЗАДАЧИ СБОРКИ/ПРОВЕРКИ POSmail (Soroka-Native, Rust + Win32)
+  // ============================================================
+  // ПОЧЕМУ ТАК: линковщик MSVC (link.exe) на этой машине поднимается
+  // ТОЛЬКО через vcvarsall.bat — Build Tools стоят в E:\BuildTools
+  // (нестандартный путь), и без vcvars линковка падает с
+  // «Отказано в доступе (os error 5)» (проверено). Поэтому все
+  // связывающие задачи идут через «call vcvarsall && cargo …».
+  //
+  // Тулчейн Rust лежит на E:\rust (RUSTUP_HOME/CARGO_HOME), потому что
+  // на C: почти нет места; путь к cargo фиксированный:
+  // E:\rust\cargo\bin\cargo.exe (не полагаемся на PATH).
+  //
+  // Все задачи исполняются под cmd.exe (нужны «&&» и «>nul» из
+  // vcvars-обёртки; PowerShell 5.1 «&&» не понимает).
+  //
+  // Правило WORKFLOW: перед каждым коммитом — задача
+  // «cycle: build+test+clippy», все три шага должны быть зелёными.
+  "options": {
+    "cwd": "${workspaceFolder}",
+    "env": {
+      "RUSTUP_HOME": "E:\\rust\\rustup",
+      "CARGO_HOME": "E:\\rust\\cargo"
+    },
+    "shell": {
+      "executable": "cmd.exe",
+      "args": ["/c"]
+    }
+  },
+  "tasks": [
+    {
+      // Сборка итогового exe для ежедневного использования.
+      "label": "build: release",
+      "detail": "Сборка релизного POSmail.exe (cargo build --release): LTO, opt-level=s, strip — итоговый бинарник target\\release\\POSmail.exe. Линковщик MSVC поднимается через vcvarsall (Build Tools в E:\\BuildTools). Задача по умолчанию для Ctrl+Shift+B; её же вызывает отладка «release, cppvsdbg».",
+      "type": "shell",
+      "command": "call \"E:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" x64 >nul 2>&1 && E:\\rust\\cargo\\bin\\cargo.exe build --release",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      // Сборка для отладчика: быстро, с PDB и всеми символами.
+      "label": "build: debug",
+      "detail": "Сборка отладочной версии (cargo build): без оптимизаций и LTO, с debug-информацией (PDB) — для точек останова и читаемых стек-трейсов в cppvsdbg/CodeLLDB. Артефакт target\\debug\\POSmail.exe + POSmail.pdb. Быстрее release в разы (без LTO).",
+      "type": "shell",
+      "command": "call \"E:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" x64 >nul 2>&1 && E:\\rust\\cargo\\bin\\cargo.exe build",
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      // Юнит-тесты ядра и обёрток (правило WORKFLOW перед коммитом).
+      "label": "test",
+      "detail": "Прогон юнит-тестов (cargo test): ядро почты Soroka (accounts/store/imap — 55), русские даты (dates — 8), layout.json (layout_store — 5+), настройки (settings — 16), ключ GigaChat (gigachat — 3). Линкует тестовый бинарник — тоже требует vcvarsall. Правило WORKFLOW: зелёные тесты перед каждым коммитом.",
+      "type": "shell",
+      "command": "call \"E:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" x64 >nul 2>&1 && E:\\rust\\cargo\\bin\\cargo.exe test",
+      "group": "test",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      // Статический анализ: любое предупреждение = ошибка (WORKFLOW).
+      "label": "clippy (-D warnings)",
+      "detail": "Статический анализ clippy c флагом -D warnings: ЛЮБОЕ предупреждение падает ошибкой — правило WORKFLOW (clypy чист перед коммитом). Линковки не требует (только проверка типов), vcvarsall не нужен — потому и отдельная задача, чтобы гонять быстро.",
+      "type": "shell",
+      "command": "E:\\rust\\cargo\\bin\\cargo.exe clippy --all-targets -- -D warnings",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      // rustfmt + возврат нетронутого ядра (правило WORKFLOW).
+      "label": "fmt (без правки ядра src/mail)",
+      "detail": "Форматирование rustfmt по всем исходникам, ПОСЛЕ ЧЕГО git-ом откатываются src/mail (ядро Soroka — не редактировать) и src/backend.rs: их форматирование не входит в дифф срезов, правило WORKFLOW. Если меняли только свои модули — просто запустить и коммитить.",
+      "type": "shell",
+      "command": "E:\\rust\\cargo\\bin\\cargo.exe fmt && git checkout -- src/mail src/backend.rs",
+      "problemMatcher": []
+    },
+    {
+      // Быстрая проверка глазами: собрать и запустить приложение.
+      "label": "run: release",
+      "detail": "Собрать и запустить приложение (cargo run --release) в выделенном терминале — быстрая проверка изменений глазами. Остановка: закрыть окно POS Mail или Ctrl+C в терминале. Помнить: крестик прячет в трей (minimize_to_tray, N07) — выход через меню трея или «Файл → Выход».",
+      "type": "shell",
+      "command": "call \"E:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" x64 >nul 2>&1 && E:\\rust\\cargo\\bin\\cargo.exe run --release",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      // Полный предкоммитный цикл (WORKFLOW, шаг 2).
+      "label": "cycle: build+test+clippy",
+      "detail": "Полный предкоммитный цикл WORKFLOW одной командой: cargo build --release → cargo test → cargo clippy -D warnings. Коммитить можно только когда все три шага зелёные; иначе — показать ошибку и не коммитить. Это та самая задача, которой AutoClaw гоняет каждый срез.",
+      "type": "shell",
+      "command": "call \"E:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" x64 >nul 2>&1 && E:\\rust\\cargo\\bin\\cargo.exe build --release && E:\\rust\\cargo\\bin\\cargo.exe test && E:\\rust\\cargo\\bin\\cargo.exe clippy --all-targets -- -D warnings",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      // Полная очистка артефактов (~1-3 ГБ на E:).
+      "label": "clean",
+      "detail": "cargo clean: удалить target\\ целиком (~1-3 ГБ: все артефакты release/debug). После clean первая сборка займёт несколько минут (пересборка ~150 зависимостей + ядро). Полезно при странностях инкрементальной сборки, «призраках» старого бинарника или нехватке места.",
+      "type": "shell",
+      "command": "E:\\rust\\cargo\\bin\\cargo.exe clean",
+      "problemMatcher": []
+    }
+  ]
+}

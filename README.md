@@ -52,3 +52,6 @@ cargo run --release
 - `docs/PLAN.md` — план миграции: что переносится, что переписывается, этапы.
 - `docs/ROADMAP.md` — дорожная карта срезов после v0.3.2 (N05–N15, Фазы 2–3).
 - `docs/WORKFLOW.md` — правила работы агента над этим репозиторием.
+- `.vscode/` — окружение VS Code: tasks (build/test/clippy/fmt/run/цикл
+  WORKFLOW), launch (отладка cppvsdbg/CodeLLDB), настройки rust-analyzer
+  и тулчейна (E:\rust, vcvars x64).

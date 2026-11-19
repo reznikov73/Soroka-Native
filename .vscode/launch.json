@@ -1,0 +1,74 @@
+{
+  "version": "0.2.0",
+  // ============================================================
+  // ОТЛАДКА POSmail в VS Code (Rust + Win32 + WebView2)
+  // ============================================================
+  // Два отладчика на выбор, по установленным расширениям:
+  //   • cppvsdbg (ms-vscode.cpptools) — native-отладчик Windows, работает
+  //     с PDB, которые Rust на MSVC-таргете пишет рядом с exe. ОСНОВНОЙ.
+  //   • lldb (vadimcn.vscode-lldb, CodeLLDB) — LLVM-отладчик, в ряде
+  //     случаев лучше показывает Rust-типы. Альтернатива.
+  // Конфигурации с неустановленным расширением просто не показываются
+  // в списке отладки — мешать не будут.
+  //
+  // ВАЖНО про release: [profile.release] в Cargo.toml содержит strip=true —
+  // символы вырезаны, отладка release-сборки ограничена (без имён функций
+  // и переменных). Для отладки используйте debug-конфигурацию.
+  //
+  // Точки останова ставятся прямо в .rs (wndproc, layout, backend и т.д.);
+  // перерывы на Win32-сообщения (WM_SIZE/WM_PAINT) — обычные функции.
+  // preLaunchTask пересобирает перед каждым запуском, чтобы отлаживать
+  // актуальный код; при изменении Cargo.toml первый запуск пересоберёт
+  // зависимости дольше.
+  "configurations": [
+    {
+      // Основная рабочая конфигурация: debug-сборка + native-отладчик.
+      "name": "POSmail — отладка (debug, cppvsdbg): точки останова, PDB",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\target\\debug\\POSmail.exe",
+      "cwd": "${workspaceFolder}",
+      // Пересборка debug-версии перед запуском (задача из tasks.json).
+      "preLaunchTask": "build: debug",
+      // stdout/stderr приложения (ошибки запуска, паники) — в терминал VS Code.
+      "console": "integratedTerminal",
+      // Где искать PDB-символы (Rust пишет их рядом с exe).
+      "symbolSearchPath": "${workspaceFolder}\\target\\debug",
+      "env": {
+        "RUSTUP_HOME": "E:\\rust\\rustup",
+        "CARGO_HOME": "E:\\rust\\cargo"
+      }
+    },
+    {
+      // Отладка релизной сборки: символы вырезаны (strip=true) — только
+      // ассемблерный уровень и внешние стеки. Редко нужно; держим для
+      // воспроизведения проблем, специфичных для release (LTO/оптимизации).
+      "name": "POSmail — отладка (release, cppvsdbg): символы вырезаны (strip)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\target\\release\\POSmail.exe",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build: release",
+      "console": "integratedTerminal",
+      "symbolSearchPath": "${workspaceFolder}\\target\\release",
+      "env": {
+        "RUSTUP_HOME": "E:\\rust\\rustup",
+        "CARGO_HOME": "E:\\rust\\cargo"
+      }
+    },
+    {
+      // Альтернативный отладчик (CodeLLDB): если cppvsdbg не установлен
+      // или нужен другой формат отображения Rust-значений.
+      "name": "POSmail — отладка (debug, CodeLLDB): альтернативный отладчик",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}\\target\\debug\\POSmail.exe",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build: debug",
+      "env": {
+        "RUSTUP_HOME": "E:\\rust\\rustup",
+        "CARGO_HOME": "E:\\rust\\cargo"
+      }
+    }
+  ]
+}

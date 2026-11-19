@@ -1,0 +1,53 @@
+{
+  // ============================================================
+  // НАСТРОЙКИ VS Code ДЛЯ Soroka-Native (Rust + Win32 + WebView2)
+  // ============================================================
+
+  // --- rust-analyzer: языковой сервер Rust -------------------
+  // Проверка при сохранении идёт через CLIPPY (а не cargo check):
+  // правило WORKFLOW — репозиторий держится чистым по
+  // «clippy --all-targets -- -D warnings», ошибки видны прямо в редакторе.
+  "rust-analyzer.check.command": "clippy",
+  // Проверять только основной бин (POSmail), не тесты: быстрее,
+  // а тесты всё равно проверяются задачей «test».
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.cargo.allTargets": false,
+
+  // --- Форматирование ----------------------------------------
+  // Форматировать rustfmt'ом при сохранении (репозиторий отформатирован).
+  // ВНИМАНИЕ: rust-analyzer форматирует и файлы src/mail/ — после правок
+  // ядра проверяйте git diff, лишнее форматирование откатывается
+  // (git checkout -- src/mail), ядро Soroka не редактируем (WORKFLOW).
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  },
+
+  // --- Тулчейн (лежит вне C:, потому что C: почти полон) -----
+  // RUSTUP_HOME/CARGO_HOME заданы и на уровне пользователя (E:\rust),
+  // здесь дублируются, чтобы терминалы VS Code гарантированно видели
+  // cargo/rustup при любом способе запуска VS Code.
+  "terminal.integrated.env.windows": {
+    "RUSTUP_HOME": "E:\\rust\\rustup",
+    "CARGO_HOME": "E:\\rust\\cargo"
+  },
+
+  // --- Не индексировать артефакты сборки ----------------------
+  // target\ скрыт из обозревателя (внутри ~1-3 ГБ: release+debug+тесты),
+  // исключён из поиска и наблюдения файловой системы — иначе rust-analyzer
+  // и поиск тормозят на тысячах сгенерированных файлов.
+  "files.exclude": { "**/target": true },
+  "search.exclude": {
+    "**/target": true,
+    // Локальный журнал сборки агентов (в .gitignore) — в поиске не нужен.
+    "**/docs/build-log.txt": true,
+    // Cargo.lock генерируется автоматически — из поиска исключён.
+    "**/Cargo.lock": true
+  },
+  "files.watcherExclude": { "**/target/**": true },
+
+  // --- TOML: Cargo.toml, rust-toolchain.toml ------------------
+  // Расширение tamasfe.even-better-toml (см. .vscode/extensions.json)
+  // валидирует Cargo.toml и знает схему.
+  "[toml]": { "editor.defaultFormatter": "tamasfe.even-better-toml" }
+}
