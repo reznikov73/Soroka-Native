@@ -6,21 +6,30 @@
 
 use std::sync::mpsc::Sender;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, HGDIOBJ};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT, DeleteObject, EndPaint, FillRect, HBRUSH, HDC,
+    HGDIOBJ, InvalidateRect, PAINTSTRUCT, SetBkColor, SetTextColor,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL,
-    ES_PASSWORD, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_ARROW, LoadCursorW,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW, RegisterClassW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WM_SIZE, WNDCLASSW,
-    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    BN_CLICKED, BeginDeferWindowPos, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
+    DefWindowProcW, DeferWindowPos, DestroyWindow, ES_AUTOHSCROLL, ES_PASSWORD, EndDeferWindowPos,
+    GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_OK, MINMAXINFO, MessageBoxW, RegisterClassW, SWP_NOZORDER,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_NCCREATE, WM_PAINT, WM_SETFONT, WM_SIZE,
+    WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
+use crate::WM_APP_DLG_THEME;
 use crate::backend::{Job, LoginOutcome, WM_APP_LOGIN_RESULT};
 use crate::state::AppState;
+use crate::theme;
 use crate::wide::{read_text, set_window_text, wide};
 
 /// Главное окно перестраивает дерево после сохранения ящика.
@@ -55,6 +64,11 @@ struct AccountState {
     hwnd_btn_save: HWND,
     hwnd_btn_cancel: HWND,
     hwnd_status: HWND,
+    /// Тема диалога (лечение v0.3.11, как compose): кисти фона/полей — в
+    /// стейте, WM_CTLCOLOR* приходят на каждую перерисовку.
+    dark: bool,
+    hbr_bg: HBRUSH,
+    hbr_surface: HBRUSH,
     testing: bool,
 }
 
@@ -71,6 +85,10 @@ pub fn open(hwnd_main: HWND, st: &AppState) -> Option<HWND> {
 
     let hmod = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
     let wc = WNDCLASSW {
+        // CS_HREDRAW/CS_VREDRAW — как у главного окна и редактора: ресайз
+        // перекрашивает клиент целиком, обнажившиеся края не остаются
+        // «призраками» (стирание — в WM_ERASEBKGND ниже).
+        style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(wndproc),
         hInstance: windows::Win32::Foundation::HINSTANCE(hmod.0),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.expect("LoadCursorW"),
@@ -92,6 +110,9 @@ pub fn open(hwnd_main: HWND, st: &AppState) -> Option<HWND> {
         hwnd_btn_save: HWND::default(),
         hwnd_btn_cancel: HWND::default(),
         hwnd_status: HWND::default(),
+        dark: st.dark,
+        hbr_bg: HBRUSH::default(),
+        hbr_surface: HBRUSH::default(),
         testing: false,
     });
     let raw = Box::into_raw(state);
@@ -101,7 +122,9 @@ pub fn open(hwnd_main: HWND, st: &AppState) -> Option<HWND> {
             WINDOW_EX_STYLE(0),
             WINDOW_CLASS,
             w!("Добавить ящик — POS Mail"),
-            WS_OVERLAPPEDWINDOW,
+            // WS_CLIPCHILDREN (как в главном окне и редакторе): фон окна
+            // не рисуется поверх контролов при переложении.
+            WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0),
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             560,
@@ -165,7 +188,10 @@ unsafe fn child(
             WINDOW_EX_STYLE(0),
             class,
             text_ptr,
-            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | style),
+            // WS_CLIPSIBLINGS: батч-переложение детей — без клиппинга
+            // соседей перекрывающиеся на миг контролы рисуют поверх
+            // друг друга.
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | style),
             x,
             y,
             w,
@@ -220,29 +246,84 @@ unsafe fn layout(hwnd: HWND, st: &AccountState) {
     let w = rc.right;
     let h = rc.bottom;
     let m = 14;
-    unsafe {
-        move_window(st.hwnd_email, m + 130, 16, (w - m * 2 - 130).max(160), 24);
-        move_window(st.hwnd_pass, m + 130, 48, (w - m * 2 - 130).max(160), 24);
-        move_window(
+    // Один DeferWindowPos-батч на все десять подвижных детей (лечение
+    // v0.3.11, паттерн главного окна/compose): одна перерисовка вместо
+    // десяти отдельных SetWindowPos — при ресайзе не мерцает.
+    let entries: [(HWND, i32, i32, i32, i32); 10] = [
+        (st.hwnd_email, m + 130, 16, (w - m * 2 - 130).max(160), 24),
+        (st.hwnd_pass, m + 130, 48, (w - m * 2 - 130).max(160), 24),
+        (
             st.hwnd_imap_host,
             m + 130,
             80,
             (w - m * 2 - 130).max(160),
             24,
-        );
-        move_window(st.hwnd_imap_port, m + 130, 112, 110, 24);
-        move_window(
+        ),
+        (st.hwnd_imap_port, m + 130, 112, 110, 24),
+        (
             st.hwnd_smtp_host,
             m + 130,
             144,
             (w - m * 2 - 130).max(160),
             24,
-        );
-        move_window(st.hwnd_smtp_port, m + 130, 176, 110, 24);
-        move_window(st.hwnd_btn_test, m, h - 44, 190, 30);
-        move_window(st.hwnd_btn_save, m + 210, h - 44, 130, 30);
-        move_window(st.hwnd_btn_cancel, m + 350, h - 44, 100, 30);
-        move_window(st.hwnd_status, m, h - 74, (w - m * 2).max(200), 24);
+        ),
+        (st.hwnd_smtp_port, m + 130, 176, 110, 24),
+        (st.hwnd_btn_test, m, h - 44, 190, 30),
+        (st.hwnd_btn_save, m + 210, h - 44, 130, 30),
+        (st.hwnd_btn_cancel, m + 350, h - 44, 100, 30),
+        (st.hwnd_status, m, h - 74, (w - m * 2).max(200), 24),
+    ];
+    unsafe {
+        match BeginDeferWindowPos(entries.len() as i32) {
+            Ok(mut wpos) => {
+                for (h2, x, y, cx, cy) in &entries {
+                    wpos = DeferWindowPos(wpos, *h2, None, *x, *y, *cx, *cy, SWP_NOZORDER)
+                        .unwrap_or(wpos);
+                }
+                let _ = EndDeferWindowPos(wpos);
+            }
+            Err(_) => {
+                // Резервный путь (практически недостижим): по одному.
+                for (h2, x, y, cx, cy) in &entries {
+                    move_window(*h2, *x, *y, *cx, *cy);
+                }
+            }
+        }
+    }
+}
+
+/// Палитра темы на диалоге (лечение v0.3.11, паттерн compose): кисти
+/// фона/полей — в стейт, subtheme DarkMode_Explorer полям (тёмные
+/// скроллбары, Win10 1809+). Кнопки — системная окраска (owner-draw
+/// вне объёма). Вызывается при создании и при смене темы
+/// (WM_APP_DLG_THEME).
+unsafe fn apply_brushes(hwnd: HWND, st: &mut AccountState) {
+    let p = theme::palette(st.dark);
+    unsafe {
+        if !st.hbr_bg.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(st.hbr_bg.0));
+        }
+        if !st.hbr_surface.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(st.hbr_surface.0));
+        }
+        st.hbr_bg = CreateSolidBrush(p.bg);
+        st.hbr_surface = CreateSolidBrush(p.surface);
+        let sub = if st.dark {
+            w!("DarkMode_Explorer")
+        } else {
+            w!("Explorer")
+        };
+        for h in [
+            st.hwnd_email,
+            st.hwnd_pass,
+            st.hwnd_imap_host,
+            st.hwnd_imap_port,
+            st.hwnd_smtp_host,
+            st.hwnd_smtp_port,
+        ] {
+            let _ = SetWindowTheme(h, sub, PCWSTR::null());
+        }
+        let _ = InvalidateRect(Some(hwnd), None, true);
     }
 }
 
@@ -353,7 +434,75 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 set_font(st.hwnd_status, hfont);
                 layout(hwnd, st);
+                apply_brushes(hwnd, st);
                 let _ = SetFocus(Some(st.hwnd_email));
+            }
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            // Минимальный размер (лечение v0.3.11, как compose): ниже поля
+            // и кнопки наезжают друг на друга, статус уезжает под низ.
+            let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+            mmi.ptMinTrackSize = POINT { x: 500, y: 360 };
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => {
+            // Фон — палитра темы: обнажившееся при ресайзе закрашивается
+            // сразу, без «призраков» и мусора.
+            if let Some(st) = unsafe { st_of(hwnd) }
+                && !st.hbr_bg.is_invalid()
+            {
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                let mut rc = RECT::default();
+                if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
+                    unsafe { FillRect(hdc, &rc, st.hbr_bg) };
+                }
+            }
+            LRESULT(1)
+        }
+        WM_PAINT => {
+            // Клиент красится в WM_ERASEBKGND — валидируем кадр.
+            let mut ps = PAINTSTRUCT::default();
+            unsafe {
+                let _ = BeginPaint(hwnd, &mut ps);
+                let _ = EndPaint(hwnd, &ps);
+            }
+            LRESULT(0)
+        }
+        WM_CTLCOLOREDIT => {
+            // Поля ящика — текст палитрой на поверхности (как поле поиска
+            // главного окна).
+            if let Some(st) = unsafe { st_of(hwnd) } {
+                let p = theme::palette(st.dark);
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                unsafe {
+                    let _ = SetTextColor(hdc, p.text);
+                    let _ = SetBkColor(hdc, p.surface);
+                }
+                return LRESULT(st.hbr_surface.0 as isize);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_CTLCOLORSTATIC => {
+            // Подписи полей и статус — текст палитрой на фоне окна (иначе
+            // чёрные буквы теряются в тёмной теме).
+            if let Some(st) = unsafe { st_of(hwnd) } {
+                let p = theme::palette(st.dark);
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                unsafe {
+                    let _ = SetTextColor(hdc, p.text);
+                    let _ = SetBkColor(hdc, p.bg);
+                }
+                return LRESULT(st.hbr_bg.0 as isize);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_APP_DLG_THEME => {
+            // Смена темы при открытом диалоге (раунд 3, TASK-N04): главное
+            // окно переключило «Вид → Тёмная тема» — перекрашиваемся.
+            if let Some(st) = unsafe { st_of(hwnd) } {
+                st.dark = wparam.0 != 0;
+                unsafe { apply_brushes(hwnd, st) };
             }
             LRESULT(0)
         }
@@ -406,6 +555,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             );
             if let Some(st) = unsafe { st_of(hwnd) } {
                 unsafe {
+                    // Кисти темы — наши, освобождаем сами.
+                    if !st.hbr_bg.is_invalid() {
+                        let _ = DeleteObject(HGDIOBJ(st.hbr_bg.0));
+                    }
+                    if !st.hbr_surface.is_invalid() {
+                        let _ = DeleteObject(HGDIOBJ(st.hbr_surface.0));
+                    }
                     let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                         Some(st.parent),
                         WM_APP_ACCOUNT_CLOSED,

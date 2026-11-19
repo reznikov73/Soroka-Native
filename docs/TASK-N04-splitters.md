@@ -152,6 +152,27 @@ DOM не участвует в кадре жеста.
   EndDeferWindowPos + WM_ERASEBKGND главного. Резиновая полоса (план Б
   из ревью и v0.3.10) остаётся в запасе, если живая проверка найдёт
   остаточную рябь.
+- **Диалоги настроек/ящика — то же лечение v0.3.11 (v0.3.13):** ревью
+  справедливо заметило, что account_dlg.rs и settings_dlg.rs болели
+  той же болезнью, что compose до v0.3.11 — голый класс без кисти
+  (hbrBackground NULL, ни WM_ERASEBKGND, ни WM_PAINT), 10–11 отдельных
+  SetWindowPos на каждый WM_SIZE, нет WS_CLIPCHILDREN и минимального
+  размера. Оба диалога получили паттерн редактора v0.3.11:
+  - CS_HREDRAW|CS_VREDRAW классу, WM_ERASEBKGND — заливка палитрой
+    темы (LRESULT(1)), WM_PAINT — валидация кадра;
+  - WS_CLIPCHILDREN окну, WS_CLIPSIBLINGS детям;
+  - layout() — один батч BeginDeferWindowPos/…/EndDeferWindowPos
+    (резерв — по одному);
+  - WM_GETMINMAXINFO: настройки 460×350, ящик 500×360 — контролы
+    больше не наезжают друг на друга;
+  - WM_CTLCOLORSTATIC/EDIT/LISTBOX палитрой (подписи, пояснение ключа
+    и статус читаются в тёмной теме; поля — текст на поверхности) +
+    subtheme DarkMode_Explorer/Explorer у полей и combobox;
+  - кисти в стейте, освобождаются в WM_DESTROY;
+  - смена темы меню при открытом диалоге — на лету: WM_APP_DLG_THEME
+    из set_theme главного окна (как WM_APP_COMPOSE_THEME у редактора).
+  Кнопки/флажки остаются системной окраски (owner-draw вне объёма,
+  как и в редакторе v0.3.11).
 
 ## Осталось
 

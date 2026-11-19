@@ -120,6 +120,11 @@ const EM_SETCUEBANNER: u32 = 0x1501;
 /// Клик по вложению в панели письма (WebView2 → оболочка): lparam = индекс.
 const WM_APP_ATTACH_CLICK: u32 = WM_APP_SETTINGS_CLOSED + 1;
 
+/// Смена темы у открытых диалогов настроек/ящика (раунд 3, TASK-N04):
+/// wparam != 0 — тёмная. Живёт в main, чтобы диалоги не плодили свои
+/// константы в общей цепочке WM_APP-*.
+pub const WM_APP_DLG_THEME: u32 = WM_APP_ATTACH_CLICK + 1;
+
 /// Раскладка панелей (TASK-N04): дерево | сплиттер | список | сплиттер | тело.
 /// Ширины считаются из весов (аналог flex-grow в Soroka), минимум панели —
 /// 110px; на время жеста сплиттера (st.dragging) SetBounds панели письма
@@ -588,6 +593,18 @@ unsafe fn set_theme(hwnd: HWND, st: &mut AppState, dark: bool) {
             PostMessageW(
                 Some(h),
                 WM_APP_COMPOSE_THEME,
+                WPARAM(st.dark as usize),
+                LPARAM(0),
+            )
+        };
+    }
+    // Открытые диалоги (настройки/ящик) — тоже (раунд 3): с лечения v0.3.13
+    // у них та же палитра, что у редактора.
+    for h in [st.hwnd_settings, st.hwnd_account].into_iter().flatten() {
+        let _ = unsafe {
+            PostMessageW(
+                Some(h),
+                WM_APP_DLG_THEME,
                 WPARAM(st.dark as usize),
                 LPARAM(0),
             )
