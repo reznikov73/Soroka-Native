@@ -20,6 +20,7 @@ mod ai;
 mod autostart;
 mod backend;
 mod compose;
+mod contacts_ui;
 mod dates;
 // Черновики (TASK-N08): чистая логика (id, отпечаток изменений, заголовок
 // X-Soroka-Draft, копия/вложения в записи drafts) — тестируется на Linux.
@@ -104,9 +105,10 @@ use settings_dlg::{WM_APP_SETTINGS_CLOSED, WM_APP_SETTINGS_SAVED};
 use state::AppState;
 use tray::WM_APP_TRAY;
 use ui::{
-    EN_CHANGE, IDM_ACCOUNT_ADD, IDM_COMPOSE, IDM_DELETE, IDM_EXIT, IDM_FORWARD, IDM_REPLY,
-    IDM_REPLY_ALL, IDM_SEARCH_CLOSE, IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SETTINGS, IDM_SYNC,
-    IDM_THEME, IDM_TOGGLE_SEEN, IDM_TRAY_OPEN, IDT_AUTOSYNC, IDT_SEARCH, PANE_MIN, SEARCH_H,
+    EN_CHANGE, IDM_ACCOUNT_ADD, IDM_COMPOSE, IDM_CONTACTS, IDM_DELETE, IDM_EXIT, IDM_FORWARD,
+    IDM_REPLY, IDM_REPLY_ALL, IDM_SEARCH_CLOSE, IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SETTINGS,
+    IDM_SYNC, IDM_THEME, IDM_TOGGLE_SEEN, IDM_TRAY_OPEN, IDT_AUTOSYNC, IDT_SEARCH, PANE_MIN,
+    SEARCH_H,
     SPLIT_W, STATUS_CLASS, STATUS_H, SplitCtx, apply_mail_event, apply_theme, create_fonts,
     create_menu, empty_pane_html, enter_search, exit_search, fire_search, letter_html,
     on_get_disp_info, on_list_custom_draw, on_list_item_changed, on_tree_select, rebuild_tree,
@@ -606,7 +608,10 @@ unsafe fn set_theme(hwnd: HWND, st: &mut AppState, dark: bool) {
     }
     // Открытые диалоги (настройки/ящик) — тоже (раунд 3): с лечения v0.3.13
     // у них та же палитра, что у редактора.
-    for h in [st.hwnd_settings, st.hwnd_account].into_iter().flatten() {
+    for h in [st.hwnd_settings, st.hwnd_account, st.hwnd_contacts]
+        .into_iter()
+        .flatten()
+    {
         let _ = unsafe {
             PostMessageW(
                 Some(h),
@@ -830,6 +835,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // TASK-N09: диалог настроек (settings.json общий с Soroka).
                     if let Some(h) = settings_dlg::open(hwnd, st) {
                         st.hwnd_settings = Some(h);
+                    }
+                }
+                IDM_CONTACTS => {
+                    // TASK-N12: книга контактов (ядро mail::contacts + Store).
+                    if let Some(h) = contacts_ui::open(hwnd, st) {
+                        st.hwnd_contacts = Some(h);
                     }
                 }
                 IDM_EXIT => {
@@ -1119,6 +1130,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_ACCOUNT_CLOSED => {
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             st.hwnd_account = None;
+            LRESULT(0)
+        }
+        contacts_ui::WM_APP_CONTACTS_CLOSED => {
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            st.hwnd_contacts = None;
             LRESULT(0)
         }
         WM_APP_SEND_RESULT => {

@@ -73,6 +73,8 @@ pub struct AppState {
     pub hwnd_compose: Option<HWND>,
     /// Открыто ли окно ящика.
     pub hwnd_account: Option<HWND>,
+    /// Открыта ли книга контактов (TASK-N12).
+    pub hwnd_contacts: Option<HWND>,
     /// Открыто ли окно настроек (TASK-N09; одновременно — только одно).
     pub hwnd_settings: Option<HWND>,
 
@@ -149,6 +151,7 @@ impl AppState {
             tree_slots: Vec::new(),
             hwnd_compose: None,
             hwnd_account: None,
+            hwnd_contacts: None,
             hwnd_settings: None,
             hicon_tray: HICON::default(),
             hicon_tray_alert: HICON::default(),
