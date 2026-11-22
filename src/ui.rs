@@ -85,6 +85,7 @@ pub const IDM_THEME: u16 = 133;
 pub const IDM_SETTINGS: u16 = 134;
 /// Книга контактов (TASK-N12).
 pub const IDM_CONTACTS: u16 = 135;
+pub const IDM_CALENDAR: u16 = 136;
 /// Открыть окно из трея (TASK-N07): команда из меню трея, пункта в
 /// главном меню нет.
 pub const IDM_TRAY_OPEN: u16 = 140;
@@ -206,6 +207,12 @@ pub fn create_menu(hwnd: HWND) -> windows::core::Result<HACCEL> {
             MF_STRING,
             IDM_CONTACTS as usize,
             w!("Контакты..."),
+        );
+        item(
+            mail,
+            MF_STRING,
+            IDM_CALENDAR as usize,
+            w!("Календарь..."),
         );
         item(
             folder,

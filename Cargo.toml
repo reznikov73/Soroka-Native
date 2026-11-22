@@ -1,6 +1,6 @@
 [package]
 name = "posmail-native"
-version = "0.3.18"
+version = "0.3.19"
 edition = "2024"
 rust-version = "1.90"
 description = "POS Mail — нативная оболочка Win32 на Rust. Фаза 2: мерцание — раунд 4: резиновая полоса сплиттеров — панели не перекладываются в жесте, одна раскладка по отпусканию (TASK-N04)."
@@ -19,6 +19,7 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
+    "Win32_System_Time",
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
@@ -42,6 +43,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"          # логи в mail/* — дословный перенос, подписчик не нужен
+uuid = { version = "1", features = ["v4"] } # ics.rs Soroka: UID события
 
 [profile.release]
 lto = true

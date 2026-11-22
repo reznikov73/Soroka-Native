@@ -19,9 +19,12 @@ mod addr;
 mod ai;
 mod autostart;
 mod backend;
+// Календарь (TASK-N11): сетка месяца + события дня, ядро Store и ics.rs.
+mod calendar;
 mod compose;
 mod contacts_ui;
 mod dates;
+mod ics;
 // Черновики (TASK-N08): чистая логика (id, отпечаток изменений, заголовок
 // X-Soroka-Draft, копия/вложения в записи drafts) — тестируется на Linux.
 mod draft;
@@ -105,7 +108,8 @@ use settings_dlg::{WM_APP_SETTINGS_CLOSED, WM_APP_SETTINGS_SAVED};
 use state::AppState;
 use tray::WM_APP_TRAY;
 use ui::{
-    EN_CHANGE, IDM_ACCOUNT_ADD, IDM_COMPOSE, IDM_CONTACTS, IDM_DELETE, IDM_EXIT, IDM_FORWARD,
+    EN_CHANGE, IDM_ACCOUNT_ADD, IDM_CALENDAR, IDM_COMPOSE, IDM_CONTACTS, IDM_DELETE, IDM_EXIT,
+    IDM_FORWARD,
     IDM_REPLY, IDM_REPLY_ALL, IDM_SEARCH_CLOSE, IDM_SEARCH_FOCUS, IDM_SEARCH_GO, IDM_SETTINGS,
     IDM_SYNC, IDM_THEME, IDM_TOGGLE_SEEN, IDM_TRAY_OPEN, IDT_AUTOSYNC, IDT_SEARCH, PANE_MIN,
     SEARCH_H,
@@ -608,9 +612,14 @@ unsafe fn set_theme(hwnd: HWND, st: &mut AppState, dark: bool) {
     }
     // Открытые диалоги (настройки/ящик) — тоже (раунд 3): с лечения v0.3.13
     // у них та же палитра, что у редактора.
-    for h in [st.hwnd_settings, st.hwnd_account, st.hwnd_contacts]
-        .into_iter()
-        .flatten()
+    for h in [
+        st.hwnd_settings,
+        st.hwnd_account,
+        st.hwnd_contacts,
+        st.hwnd_calendar,
+    ]
+    .into_iter()
+    .flatten()
     {
         let _ = unsafe {
             PostMessageW(
@@ -841,6 +850,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // TASK-N12: книга контактов (ядро mail::contacts + Store).
                     if let Some(h) = contacts_ui::open(hwnd, st) {
                         st.hwnd_contacts = Some(h);
+                    }
+                }
+                IDM_CALENDAR => {
+                    // TASK-N11: календарь (Store::*_calendar_event + ics.rs).
+                    if let Some(h) = calendar::open(hwnd, st) {
+                        st.hwnd_calendar = Some(h);
                     }
                 }
                 IDM_EXIT => {
@@ -1135,6 +1150,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         contacts_ui::WM_APP_CONTACTS_CLOSED => {
             let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
             st.hwnd_contacts = None;
+            LRESULT(0)
+        }
+        calendar::WM_APP_CALENDAR_CLOSED => {
+            let st = unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState) };
+            st.hwnd_calendar = None;
             LRESULT(0)
         }
         WM_APP_SEND_RESULT => {

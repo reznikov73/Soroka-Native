@@ -75,6 +75,8 @@ pub struct AppState {
     pub hwnd_account: Option<HWND>,
     /// Открыта ли книга контактов (TASK-N12).
     pub hwnd_contacts: Option<HWND>,
+    /// Открыто ли окно календаря (TASK-N11; одновременно — только одно).
+    pub hwnd_calendar: Option<HWND>,
     /// Открыто ли окно настроек (TASK-N09; одновременно — только одно).
     pub hwnd_settings: Option<HWND>,
 
@@ -152,6 +154,7 @@ impl AppState {
             hwnd_compose: None,
             hwnd_account: None,
             hwnd_contacts: None,
+            hwnd_calendar: None,
             hwnd_settings: None,
             hicon_tray: HICON::default(),
             hicon_tray_alert: HICON::default(),
