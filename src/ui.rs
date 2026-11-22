@@ -30,7 +30,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ACCEL, AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateAcceleratorTableW, CreateMenu,
+    ACCEL, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateAcceleratorTableW,
+    CreateMenu,
     CreatePopupMenu, DefWindowProcW, DestroyMenu, FCONTROL, FNOINVERT, FSHIFT, FVIRTKEY, GWL_STYLE,
     GWLP_USERDATA, GetClientRect, GetParent, GetSystemMetrics, GetWindowLongPtrW,
     GetWindowPlacement, GetWindowTextLengthW, GetWindowTextW, HACCEL, HMENU, IDC_ARROW, IDC_SIZEWE,
@@ -320,7 +321,10 @@ const SPLITTER_CLASS: PCWSTR = w!("SorokaNativeSplitter");
 /// Регистрация класса сплиттера (один раз из run(), до создания детей).
 pub fn register_splitter_class(hmod: HMODULE) -> windows::core::Result<()> {
     let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
+        // CS_DBLCLKS обязателен: без него WM_LBUTTONDBLCLK в splitter_proc
+        // не приходит вовсе — «двойной клик сбрасывает веса» (TASK-N04)
+        // не работал на живой мыши (нашёл разбор приёмки, TASK-N04-FIX).
+        style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
         lpfnWndProc: Some(splitter_proc),
         hInstance: HINSTANCE(hmod.0),
         hCursor: unsafe { LoadCursorW(None, IDC_SIZEWE)? },
