@@ -16,23 +16,35 @@ use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows::Win32::UI::Controls::SetWindowTheme;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows::Win32::UI::Controls::{EM_GETSEL, EM_REPLACESEL, EM_SETSEL, SetWindowTheme};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetFocus, SetFocus, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_TAB, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BeginDeferWindowPos, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-    DefWindowProcW, DeferWindowPos, DestroyWindow, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-    ES_WANTRETURN, EndDeferWindowPos, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_ARROW,
-    KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LBS_NOTIFY, LoadCursorW, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_OK, MB_YESNO, MINMAXINFO, MessageBoxW, RegisterClassW, SWP_NOZORDER,
-    SetTimer, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
-    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_NCCREATE, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+    BN_CLICKED, BeginDeferWindowPos, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CallWindowProcW,
+    CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyWindow, EN_CHANGE, EN_KILLFOCUS,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, EndDeferWindowPos,
+    GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect,
+    HWND_TOP, IDC_ARROW, KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_GETITEMHEIGHT,
+    LB_ITEMFROMPOINT, LB_RESETCONTENT, LB_SETCURSEL, LBS_NOTIFY, LBS_NOINTEGRALHEIGHT,
+    LoadCursorW, MA_NOACTIVATE, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_YESNO, MINMAXINFO,
+    MessageBoxW, RegisterClassW, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE,
+    WM_COMMAND,
+    WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_NCCREATE,
+    WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
     WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
+use crate::addr;
 use crate::backend::{DraftSaved, Job, SendOutcome, WM_APP_DRAFT_SAVED, WM_APP_SEND_RESULT};
+use crate::mail::contacts::AddressSuggestion;
 use crate::mail::smtp::OutgoingAttachment;
+use crate::mail::store::Store;
 use crate::state::AppState;
 use crate::theme;
 use crate::wide::{read_text, set_window_text, wide};
@@ -58,6 +70,13 @@ const IDC_BTN_SEND: i32 = 207;
 const IDC_BTN_CANCEL: i32 = 208;
 const IDC_STATUS: i32 = 209;
 const IDC_BTN_DRAFT: i32 = 210;
+/// Список-оверлей подсказок адресов (TASK-N12).
+const IDC_SUGGEST: i32 = 211;
+
+/// Сколько подсказок показываем одновременно.
+const SUGGEST_LIMIT: usize = 8;
+/// Высота строки, если системный список не ответил.
+const ROW_H_FALLBACK: i32 = 18;
 
 /// Автосохранение черновика (порт startDraftAutosave: 20 с, TASK-022).
 const IDT_DRAFT_AUTOSAVE: usize = 3;
@@ -107,6 +126,21 @@ struct ComposeState {
     dark: bool,
     hbr_bg: HBRUSH,
     hbr_surface: HBRUSH,
+
+    // ---- подсказки адресов (TASK-N12) ----
+    /// Книга контактов + частые адресаты переписки: собрано один раз при
+    /// открытии окна, фильтрация — в памяти (без SQLite на каждый ввод).
+    suggests: Vec<AddressSuggestion>,
+    /// Текущая выдача: индекс элемента = строка в списке-подсказке.
+    suggest_items: Vec<AddressSuggestion>,
+    hwnd_suggest: HWND,
+    /// Поле, для которого открыта подсказка (Кому или Копия).
+    suggest_field: HWND,
+    suggest_shown: bool,
+    /// Исходные оконные процедуры сабклассов (тексты получателей и список).
+    old_to_proc: isize,
+    old_cc_proc: isize,
+    old_suggest_proc: isize,
 }
 
 /// Открывает редактор (один на приложение). Возвращает HWND нового окна.
@@ -171,6 +205,14 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
         dark: st.dark,
         hbr_bg: HBRUSH::default(),
         hbr_surface: HBRUSH::default(),
+        suggests: load_address_hints(),
+        suggest_items: Vec::new(),
+        hwnd_suggest: HWND::default(),
+        suggest_field: HWND::default(),
+        suggest_shown: false,
+        old_to_proc: 0,
+        old_cc_proc: 0,
+        old_suggest_proc: 0,
     });
     let raw = Box::into_raw(state);
 
@@ -238,6 +280,36 @@ pub fn open(hwnd_main: HWND, st: &AppState, prefill: Option<ComposePrefill>) -> 
 
 fn set_text(hwnd: HWND, text: &str) -> windows::core::Result<()> {
     set_window_text(hwnd, text)
+}
+
+/// Подсказки адресов для окна написания (TASK-N12): книга контактов +
+/// частые адресаты переписки. Читается один раз при открытии окна —
+/// дальше фильтрация в памяти (правило WORKFLOW: никаких блокирующих
+/// запросов к кэшу на каждое нажатие в UI-потоке).
+fn load_address_hints() -> Vec<AddressSuggestion> {
+    let Ok(store) = Store::open_default() else {
+        return Vec::new();
+    };
+    let mut out: Vec<AddressSuggestion> = store
+        .load_contacts()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| AddressSuggestion {
+            email: c.email,
+            name: c.name,
+            source: "contact".to_string(),
+            count: 0,
+        })
+        .collect();
+    let known: Vec<String> = out.iter().map(|s| s.email.to_lowercase()).collect();
+    out.extend(
+        store
+            .correspondence_contacts(200)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !known.contains(&s.email.to_lowercase())),
+    );
+    out
 }
 
 unsafe fn st_of(hwnd: HWND) -> Option<&'static mut ComposeState> {
@@ -403,11 +475,267 @@ unsafe fn apply_theme(hwnd: HWND, st: &mut ComposeState) {
             st.hwnd_subject,
             st.hwnd_body,
             st.hwnd_attach_list,
+            st.hwnd_suggest,
         ] {
             let _ = SetWindowTheme(h, sub, PCWSTR::null());
         }
         let _ = InvalidateRect(Some(hwnd), None, true);
     }
+}
+
+/// Сигнатура виндпроцедуры — для сабклассов полей и списка подсказок.
+type WndProcFn = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
+
+/// Позиция каретки в поле (в единицах UTF-16 — как их понимает EM_SETSEL).
+fn caret_pos(field: HWND) -> usize {
+    let mut start: u32 = 0;
+    let mut end: u32 = 0;
+    unsafe {
+        SendMessageW(
+            field,
+            EM_GETSEL,
+            Some(WPARAM(&mut start as *mut u32 as usize)),
+            Some(LPARAM(&mut end as *mut u32 as isize)),
+        );
+    }
+    end as usize
+}
+
+/// Прячет список подсказок и забывает текущую выдачу.
+fn hide_suggest(st: &mut ComposeState) {
+    if st.suggest_shown && !st.hwnd_suggest.0.is_null() {
+        let _ = unsafe { ShowWindow(st.hwnd_suggest, SW_HIDE) };
+    }
+    st.suggest_shown = false;
+    st.suggest_items.clear();
+    st.suggest_field = HWND::default();
+}
+
+/// Пересобирает подсказки под текущий токен поля и показывает список.
+unsafe fn update_suggest(hwnd: HWND, st: &mut ComposeState, field: HWND) {
+    hide_suggest(st);
+    if st.hwnd_suggest.0.is_null() || field.0.is_null() {
+        return;
+    }
+    // Программная установка текста (открытие черновика/ответа) не должна
+    // открывать подсказку: реагируем только на ввод в активном поле.
+    if unsafe { GetFocus() } != field {
+        return;
+    }
+    let text = read_text(field);
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let (_, _, token) = addr::token_at(&units, caret_pos(field).min(units.len()));
+    if token.trim().is_empty() {
+        return;
+    }
+    let items: Vec<AddressSuggestion> = addr::rank(&st.suggests, &token, SUGGEST_LIMIT)
+        .into_iter()
+        .cloned()
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    st.suggest_items = items;
+    st.suggest_field = field;
+    unsafe {
+        SendMessageW(st.hwnd_suggest, LB_RESETCONTENT, None, None);
+        for item in &st.suggest_items {
+            let line = if item.name.is_empty() {
+                item.email.clone()
+            } else {
+                format!("{} — {}", item.name, item.email)
+            };
+            let mut buf = wide(&line);
+            SendMessageW(
+                st.hwnd_suggest,
+                LB_ADDSTRING,
+                Some(WPARAM(0)),
+                Some(LPARAM(buf.as_mut_ptr() as isize)),
+            );
+        }
+        SendMessageW(st.hwnd_suggest, LB_SETCURSEL, Some(WPARAM(0)), None);
+    }
+    unsafe { place_suggest(hwnd, st) };
+    st.suggest_shown = true;
+}
+
+/// Ставит список под полем получателей и показывает его без активации.
+unsafe fn place_suggest(hwnd: HWND, st: &ComposeState) {
+    let mut er = RECT::default();
+    let mut wr = RECT::default();
+    if unsafe { GetWindowRect(st.suggest_field, &mut er) }.is_err()
+        || unsafe { GetWindowRect(hwnd, &mut wr) }.is_err()
+    {
+        return;
+    }
+    let x = er.left - wr.left;
+    let y = er.top - wr.top + (er.bottom - er.top);
+    let w = (er.right - er.left).max(200);
+    let item_h = unsafe { SendMessageW(st.hwnd_suggest, LB_GETITEMHEIGHT, Some(WPARAM(0)), None) }.0
+        as i32;
+    let item_h = if item_h > 0 { item_h } else { ROW_H_FALLBACK };
+    let rows = st.suggest_items.len().max(1) as i32;
+    let h = item_h * rows + 4;
+    unsafe {
+        let _ = SetWindowPos(
+            st.hwnd_suggest,
+            Some(HWND_TOP),
+            x,
+            y,
+            w,
+            h,
+            SWP_NOACTIVATE,
+        );
+        let _ = ShowWindow(st.hwnd_suggest, SW_SHOWNOACTIVATE);
+    }
+}
+
+/// Перемещение по списку стрелками (по кругу).
+fn move_suggest(st: &mut ComposeState, delta: isize) {
+    let n = st.suggest_items.len() as isize;
+    if n == 0 {
+        return;
+    }
+    let cur = unsafe { SendMessageW(st.hwnd_suggest, LB_GETCURSEL, None, None) }.0 as isize;
+    let mut next = if cur < 0 { 0 } else { cur + delta };
+    if next < 0 {
+        next = n - 1;
+    } else if next >= n {
+        next = 0;
+    }
+    unsafe {
+        SendMessageW(
+            st.hwnd_suggest,
+            LB_SETCURSEL,
+            Some(WPARAM(next as usize)),
+            None,
+        );
+    }
+}
+
+/// Подставляет выбранную подсказку вместо текущего токена поля.
+unsafe fn accept_suggestion(st: &mut ComposeState, index: usize) {
+    let Some(item) = st.suggest_items.get(index).cloned() else {
+        return;
+    };
+    let field = st.suggest_field;
+    if field.0.is_null() {
+        return;
+    }
+    let text = read_text(field);
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let (start, end, _) = addr::token_at(&units, caret_pos(field).min(units.len()));
+    let repl = addr::recipient_text(&item);
+    let mut buf = wide(&repl);
+    unsafe {
+        SendMessageW(
+            field,
+            EM_SETSEL,
+            Some(WPARAM(start)),
+            Some(LPARAM(end as isize)),
+        );
+        SendMessageW(
+            field,
+            EM_REPLACESEL,
+            Some(WPARAM(1)),
+            Some(LPARAM(buf.as_mut_ptr() as isize)),
+        );
+        hide_suggest(st);
+        let _ = SetFocus(Some(field));
+    }
+}
+
+/// Клавиши в поле при открытом списке: true — клавиша обработана.
+fn on_suggest_key(st: &mut ComposeState, vk: u16) -> bool {
+    match vk {
+        v if v == VK_DOWN.0 => {
+            move_suggest(st, 1);
+            true
+        }
+        v if v == VK_UP.0 => {
+            move_suggest(st, -1);
+            true
+        }
+        v if v == VK_RETURN.0 || v == VK_TAB.0 => {
+            let cur = unsafe { SendMessageW(st.hwnd_suggest, LB_GETCURSEL, None, None) }.0;
+            if cur >= 0 {
+                unsafe { accept_suggestion(st, cur as usize) };
+            }
+            true
+        }
+        v if v == VK_ESCAPE.0 => {
+            hide_suggest(st);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Сабкласс полей «Кому»/«Копия»: стрелки/Enter/Esc принадлежат подсказке,
+/// пока она открыта; во всех остальных случаях — родному EDIT.
+unsafe extern "system" fn suggest_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+    let mut old = 0isize;
+    if let Some(st) = unsafe { st_of(parent) } {
+        old = if hwnd == st.hwnd_to {
+            st.old_to_proc
+        } else {
+            st.old_cc_proc
+        };
+        if msg == WM_KEYDOWN && st.suggest_shown && on_suggest_key(st, wparam.0 as u16) {
+            return LRESULT(0);
+        }
+    }
+    if old == 0 {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    let old_fn: WndProcFn = unsafe { std::mem::transmute::<isize, WndProcFn>(old) };
+    unsafe { CallWindowProcW(Some(old_fn), hwnd, msg, wparam, lparam) }
+}
+
+/// Сабкласс списка-подсказки: клик выбирает строку, но не забирает фокус
+/// у поля ввода (MA_NOACTIVATE) — иначе подсказка закрылась бы до выбора.
+unsafe extern "system" fn suggest_list_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_MOUSEACTIVATE {
+        return LRESULT(MA_NOACTIVATE as isize);
+    }
+    let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
+    let mut old = 0isize;
+    if let Some(st) = unsafe { st_of(parent) } {
+        old = st.old_suggest_proc;
+        // Выбор — по WM_LBUTTONDOWN: обрабатываем до того, как список
+        // заберёт фокус у поля (иначе EN_KILLFOCUS успевает спрятать
+        // подсказку и WM_LBUTTONUP приходит уже в пустой список).
+        if msg == WM_LBUTTONDOWN && st.suggest_shown {
+            let packed =
+                unsafe { SendMessageW(hwnd, LB_ITEMFROMPOINT, Some(WPARAM(0)), Some(lparam)) }.0
+                    as u32;
+            let index = (packed & 0xFFFF) as usize;
+            let outside = (packed >> 16) & 1 != 0;
+            if !outside {
+                unsafe { accept_suggestion(st, index) };
+            }
+            return LRESULT(0);
+        }
+        if msg == WM_LBUTTONUP && st.suggest_shown {
+            return LRESULT(0);
+        }
+    }
+    if old == 0 {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    let old_fn: WndProcFn = unsafe { std::mem::transmute::<isize, WndProcFn>(old) };
+    unsafe { CallWindowProcW(Some(old_fn), hwnd, msg, wparam, lparam) }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -559,6 +887,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     IDC_STATUS,
                 );
                 set_font(st.hwnd_status, hfont);
+                // Подсказки адресов (TASK-N12): список-оверлей, изначально
+                // скрыт; клик по нему не забирает фокус у поля (MA_NOACTIVATE).
+                st.hwnd_suggest = child(
+                    hwnd,
+                    w!("LISTBOX"),
+                    None,
+                    LBS_NOTIFY as u32 | LBS_NOINTEGRALHEIGHT as u32 | WS_BORDER.0,
+                    0,
+                    0,
+                    200,
+                    80,
+                    IDC_SUGGEST,
+                );
+                set_font(st.hwnd_suggest, hfont);
+                let _ = ShowWindow(st.hwnd_suggest, SW_HIDE);
+                st.old_to_proc = SetWindowLongPtrW(
+                    st.hwnd_to,
+                    GWLP_WNDPROC,
+                    suggest_edit_proc as *const () as usize as isize,
+                );
+                st.old_cc_proc = SetWindowLongPtrW(
+                    st.hwnd_cc,
+                    GWLP_WNDPROC,
+                    suggest_edit_proc as *const () as usize as isize,
+                );
+                st.old_suggest_proc = SetWindowLongPtrW(
+                    st.hwnd_suggest,
+                    GWLP_WNDPROC,
+                    suggest_list_proc as *const () as usize as isize,
+                );
                 layout(hwnd, st);
                 apply_theme(hwnd, st);
             }
@@ -592,6 +950,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_SIZE => {
             if let Some(st) = unsafe { st_of(hwnd) } {
+                // Подсказка позиционируется под полем — при ресайзе её прячем.
+                hide_suggest(st);
                 unsafe { layout(hwnd, st) };
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -628,6 +988,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            // Ввод в полях получателей (TASK-N12): пересобрать подсказки.
+            if lparam.0 != 0 && code == EN_CHANGE && (id == IDC_TO || id == IDC_CC) {
+                if let Some(st) = unsafe { st_of(hwnd) } {
+                    let field = if id == IDC_TO { st.hwnd_to } else { st.hwnd_cc };
+                    unsafe { update_suggest(hwnd, st, field) };
+                }
+                return LRESULT(0);
+            }
+            // Уход фокуса из поля — подсказка не должна висеть поверх окна.
+            if lparam.0 != 0 && code == EN_KILLFOCUS && (id == IDC_TO || id == IDC_CC) {
+                if let Some(st) = unsafe { st_of(hwnd) } {
+                    hide_suggest(st);
+                }
+                return LRESULT(0);
+            }
             if lparam.0 != 0 && code == BN_CLICKED {
                 match id {
                     IDC_BTN_ATTACH => {

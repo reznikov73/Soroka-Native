@@ -15,6 +15,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod account_dlg;
+mod addr;
 mod ai;
 mod autostart;
 mod backend;
