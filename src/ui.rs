@@ -18,7 +18,8 @@ use windows::Win32::UI::Controls::{
     CDRF_NOTIFYSUBITEMDRAW, HTREEITEM, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH,
     LVCOLUMNW, LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
     LVM_DELETECOLUMN, LVM_GETHEADER, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_SETBKCOLOR,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETTEXTBKCOLOR,
+    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
+    LVM_SETTEXTBKCOLOR,
     LVM_SETTEXTCOLOR, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, NMLISTVIEW, NMLVCUSTOMDRAW,
     NMLVDISPINFOW, NMTREEVIEWW, SetWindowTheme, TVE_EXPAND, TVGN_CARET, TVHITTESTINFO, TVHT_ONITEM,
     TVI_LAST, TVI_ROOT, TVIF_HANDLE, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0,
@@ -897,19 +898,60 @@ pub fn set_list_columns(hwnd_list: HWND, search: bool) {
     }
     if search {
         unsafe {
-            lv_column(hwnd_list, 0, "Вл.", 44);
-            lv_column(hwnd_list, 1, "От", 200);
+            lv_column(hwnd_list, 0, "Вл.", 36);
+            lv_column(hwnd_list, 1, "От", 180);
             lv_column(hwnd_list, 2, "Тема", 350);
-            lv_column(hwnd_list, 3, "Папка", 150);
-            lv_column(hwnd_list, 4, "Дата", 140);
+            lv_column(hwnd_list, 3, "Папка", 110);
+            lv_column(hwnd_list, 4, "Дата", 110);
         }
     } else {
         unsafe {
-            lv_column(hwnd_list, 0, "Вл.", 44);
-            lv_column(hwnd_list, 1, "От", 240);
+            lv_column(hwnd_list, 0, "Вл.", 36);
+            lv_column(hwnd_list, 1, "От", 180);
             lv_column(hwnd_list, 2, "Тема", 460);
-            lv_column(hwnd_list, 3, "Дата", 150);
+            lv_column(hwnd_list, 3, "Дата", 110);
         }
+    }
+    // Сразу подгоняем под текущую ширину списка (TASK-N04: сплиттеры).
+    let mut rc = RECT::default();
+    if unsafe { GetClientRect(hwnd_list, &mut rc) }.is_ok() {
+        fit_list_columns(hwnd_list, rc.right, search);
+    }
+}
+
+/// Ширины колонок под ширину панели списка.
+///
+/// Сплиттеры (TASK-N04) меняют ширину панели, а колонки были заданы
+/// фиксированными при входе/выходе из поиска (TASK-N03) — «Дата» уезжала
+/// за край и появлялась горизонтальная прокрутка. Фиксированные ширины
+/// у «Вл.», «От» и «Дата» (и «Папки» в поиске), остаток забирает «Тема».
+pub fn fit_list_columns(hwnd_list: HWND, list_px: i32, search: bool) {
+    // Ширины — минимумы, а не «как в Soroka»: панель списка узкая по
+    // умолчанию (веса сплиттеров) и меняется жестом, поэтому «Тема»
+    // забирает остаток, а не 460 px по умолчанию — иначе горизонтальная
+    // прокрутка и обрезанная «Дата».
+    let (mark, from, folder, date) = if search {
+        (36, 170, 110, 120)
+    } else {
+        (36, 170, 0, 120)
+    };
+    let subject = (list_px - (mark + from + folder + date) - 6).max(90);
+    let width = |i: usize, cx: i32| unsafe {
+        SendMessageW(
+            hwnd_list,
+            LVM_SETCOLUMNWIDTH,
+            Some(WPARAM(i)),
+            Some(LPARAM(cx as isize)),
+        );
+    };
+    width(0, mark);
+    width(1, from);
+    width(2, subject);
+    if search {
+        width(3, folder);
+        width(4, date);
+    } else {
+        width(3, date);
     }
 }
 
@@ -964,6 +1006,17 @@ fn folder_display(name: &str) -> String {
 /// Перестраивает дерево: ящики → папки из кэша. Выбирает первый INBOX.
 pub fn rebuild_tree(hwnd_tv: HWND, st: &mut AppState) {
     st.accounts = load_accounts();
+    // Папки, которые уже были в дереве: если кэш сейчас не читается
+    // (короткий SQLITE_BUSY у рабочего потока), не показываем ящик пустым —
+    // иначе папки «моргают» при каждой перестройке (замечание TASK-N02).
+    let previous: Vec<String> = st
+        .tree_slots
+        .iter()
+        .filter_map(|s| match s {
+            TreeSlot::Folder { key, .. } => Some(key.clone()),
+            TreeSlot::Account { .. } => None,
+        })
+        .collect();
     st.tree_slots.clear();
     unsafe {
         SendMessageW(
@@ -983,15 +1036,16 @@ pub fn rebuild_tree(hwnd_tv: HWND, st: &mut AppState) {
         let h_acc = unsafe { tv_insert(hwnd_tv, TVI_ROOT, &acc.email, acc_slot) };
 
         let like = format!("{}::%", acc.id);
-        let mut folders: Vec<String> = Store::open_default()
-            .map(|s| {
-                s.load_folders(&like)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|f| f.name)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let prefix = format!("{}::", acc.id);
+        let mut folders: Vec<String> = match Store::open_default().map(|s| s.load_folders(&like))
+        {
+            Ok(Ok(list)) => list.into_iter().map(|f| f.name).collect(),
+            _ => previous
+                .iter()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect(),
+        };
         // INBOX первым, дальше по алфавиту — как refresh_folders в Soroka.
         folders.sort_by(|a, b| {
             let inbox = |n: &str| n.ends_with("::INBOX");

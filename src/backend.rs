@@ -383,8 +383,23 @@ fn sync_folder(key: &str) -> Vec<MailEvent> {
                             is_drafts: f.is_drafts,
                         })
                         .collect();
-                    let _ = store.save_sync(&acc.id, total, &headers, &keyed);
-                    folders_refreshed = true;
+                    // TASK-N02-FIX: частичный LIST (Mail.ru иногда отдаёт не весь
+                    // список) не должен уносить из дерева папки с письмами: полная
+                    // замена списка чистит их кэш (prune_folders).
+                    let known: Vec<String> = store
+                        .load_folders(&format!("{}::%", acc.id))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|f| f.name)
+                        .collect();
+                    let fresh: Vec<String> = keyed.iter().map(|f| f.name.clone()).collect();
+                    if list_looks_partial(&known, &fresh, |k| store.folder_total(k) > 0) {
+                        let unseen = headers.iter().filter(|m| !m.seen).count() as u32;
+                        let _ = store.save_folder_sync(key, total, unseen, &headers);
+                    } else {
+                        let _ = store.save_sync(&acc.id, total, &headers, &keyed);
+                        folders_refreshed = true;
+                    }
                 }
                 Err(_) => {
                     let _ = store.save_folder_sync(key, total, fetched, &headers);
@@ -921,6 +936,23 @@ fn save_sent_copy(cfg: &imap::AccountConfig, raw: &[u8]) -> SentReport {
     }
 }
 
+/// Свежий LIST не содержит папок, у которых есть закэшированные письма?
+///
+/// Такой список считаем частичным: полная замена таблицы `folders` в этом
+/// случае убрала бы папку из дерева и — через `prune_folders` ядра — стёрла
+/// бы её кэш писем. Лучше оставить список папок как есть до следующего
+/// удачного LIST (TASK-N02-FIX).
+fn list_looks_partial(
+    known: &[String],
+    fresh: &[String],
+    has_cache: impl Fn(&str) -> bool,
+) -> bool {
+    !fresh.is_empty()
+        && known
+            .iter()
+            .any(|k| !fresh.iter().any(|f| f == k) && has_cache(k))
+}
+
 /// Порт flush_outbox (TASK-089): досылка очереди после успешной синхронизации.
 /// Возвращает число отправленных писем.
 fn flush_outbox() -> usize {
@@ -976,4 +1008,27 @@ fn flush_outbox() -> usize {
         }
     }
     sent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list_looks_partial;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn partial_list_is_detected_only_when_cache_would_be_lost() {
+        let known = v(&["acc::INBOX", "acc::Sent", "acc::Trash"]);
+        let cached = |k: &str| k == "acc::Sent";
+        // Свежий LIST без «Отправленные», у которых есть письма, — частичный.
+        assert!(list_looks_partial(&known, &v(&["acc::INBOX", "acc::Trash"]), cached));
+        // Папка без кэша пропала — это не потеря данных, список полный.
+        assert!(!list_looks_partial(&known, &v(&["acc::INBOX", "acc::Sent"]), cached));
+        // Полный список — не частичный; пустой ответ сервера не считаем
+        // «всё удалено» (этим занимаются другие защиты ядра).
+        assert!(!list_looks_partial(&known, &known.clone(), cached));
+        assert!(!list_looks_partial(&known, &[], cached));
+    }
 }

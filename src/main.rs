@@ -211,6 +211,11 @@ unsafe fn layout(hwnd: HWND, st: &mut AppState) {
                 bottom: h_main,
             });
         }
+        // Колонки под ширину панели списка (сплиттеры). Во время жеста не
+        // трогаем — одна подгонка по отпусканию, чтобы не мигать.
+        if !st.dragging {
+            ui::fit_list_columns(st.hwnd_list, list_px, search_open);
+        }
     }
 }
 
@@ -1285,7 +1290,7 @@ fn run() -> Result<()> {
             // + двойная буферизация контролов (манифест comctl32 v6).
             WINDOW_EX_STYLE(0),
             WINDOW_CLASS,
-            w!("POS Mail — Фаза 1: почтовый каркас"),
+            w!("POS Mail"),
             WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0),
             CW_USEDEFAULT,
             CW_USEDEFAULT,
